@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Memory and runtime state produced by the agent (only at the repo root)
+/memory/
+*.sqlite3
+voice_utterances.jsonl
+episodic.jsonl
+procedural.json
+
+# Local configuration
+config.local.json
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

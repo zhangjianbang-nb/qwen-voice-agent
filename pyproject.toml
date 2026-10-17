@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-voice-agent"
+version = "0.1.0"
+description = "A 24/7 full-duplex voice agent: voiceprint + VAD perception, Qwen ASR/TTS/LLM inference, and a five-type memory"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+keywords = ["voice-agent", "vad", "speaker-verification", "qwen", "asr", "tts", "full-duplex", "memory"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# The runtime core is deliberately thin: numpy only.  Everything heavier
+# (ONNX speaker/VAD models, microphone capture, scipy's polyphase resampler,
+# HTTP model servers) is an extra, because a voice agent that cannot run on a
+# machine without a microphone or a GPU is not testable.
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+# Silero VAD and any ONNX speaker-embedding model (3D-Speaker / ECAPA / WeSpeaker).
+onnx = ["onnxruntime>=1.16"]
+# Live microphone capture and playback through PortAudio.
+mic = ["sounddevice>=0.4"]
+# Higher-quality polyphase resampling and richer audio IO.
+dsp = ["scipy>=1.9"]
+# A local `edge-tts`-style command TTS backend needs no Python package: the CLI
+# binary is invoked as a subprocess and its WAV output is read back.
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+qwen-voice-agent = "qwen_voice_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::FutureWarning"]
