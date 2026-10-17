@@ -1,0 +1,22 @@
+[独立评审请求 · 与其它话题无关，请只回答本问题]
+
+我在设计一个「24 小时全双工语音交互智能体」的项目（qwen-voice-agent，Python，纯 numpy 核心）。规格是：
+- 感知：声纹采集（speaker embedding + 识别）+ 人声感知（VAD + 整段切分）
+- 推理：Qwen ASR + Qwen TTS + Qwen3.8 小 LLM
+- 记忆：五类（声音记忆 / 工作记忆 / 语义记忆 / 情景记忆 / 程序记忆）
+- 功能：24h 实时监听、对话、全双工（用户可随时打断 agent）
+
+我的关键设计决策：
+1. 运行时核心只依赖 numpy；torch/scipy/onnxruntime/sounddevice 全部降级为可选 extras，由需要它的 backend 惰性 import。理由：本机无麦克风（arecord 为空）、torch 是 CPU-only，重依赖会让项目不可测试。
+2. ASR / TTS / LLM / 声纹嵌入各自藏在一个 backend protocol 后面，各有 http（真实服务）/ transformers（本地权重）/ scripted / mock（确定性桩）四种实现；pipeline 不知道自己在跟哪种后端说话。
+3. 全双工实现：VAD 闭合一句话时启动一个「生成 worker 线程」跑 ASR→LLM→TTS→播放；主线程持续读音频帧做 VAD；若在生成期间 VAD 连续 start_frames 帧判定为语音，就 set 该 worker 的 cancel event（打断），worker 在下一个检查点退出，主循环回到 LISTENING 并把这帧当作新话的开头。生成与监听通过线程安全队列解耦。
+4. 五类记忆：voice=JSONL（谁何时说了什么+嵌入）、working=进程内 TTL 环形（条数上限+TTL）、semantic=SQLite 键值事实（原地更新）、episodic=JSONL 事件流（append-only）、procedural=JSON 技能/家规。MemoryManager.context_block(person, query) 按「字符预算」自上而下拼上下文块（身份→事实→家规→最近轮次→最近事件），超预算的块整块丢弃而不是截断。
+5. 24h loop：有 max_seconds/max_turns（可界定）、idle_timeout_s、worker_timeout_s（卡死 worker 的取消点）、maintenance_interval_s（周期 prune 记忆）、SIGTERM/SIGINT 优雅退出（停 sink、flush 记忆、关 source）。
+
+我自己担心的风险点：
+a) barge-in 时如果 TTS 正在通过 sounddevice 阻塞播放，cancel 无法真正中断播放（只有生成前的检查点能拦）；
+b) worker 线程会读 MemoryManager（context_block），主线程会写（observe），我用 sqlite check_same_thread=False + 锁 和 manager 级锁处理，但不确定是否覆盖所有竞态；
+c) 声纹的默认 backend 是 mel（log-mel 统计池化），这是确定性占位、不是真 speaker 模型，对「同一人不同话」不鲁棒；
+d) 全双工的 barge-in 判据直接用 VAD 的 speech_prob 阈值，可能在 agent 自己播放的声音被麦克风回采（回声）时误触发自我打断。
+
+请评审这套架构：哪些决策是对的、哪些有明显缺陷、有哪些我没想到的失败模式（尤其 24h 长跑与全双工部分）？给出具体改进建议，按优先级排序。不用客套，直接指出问题。

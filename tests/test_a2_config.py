@@ -45,3 +45,20 @@ def test_env_bool_variants(monkeypatch):
     for raw, expected in [("1", True), ("true", True), ("yes", True), ("on", True), ("0", False), ("false", False)]:
         monkeypatch.setenv("QVA_VOICEPRINT_ENABLED", raw)
         assert VoiceAgentConfig.from_env().voiceprint.enabled is expected
+
+
+def test_env_override_for_none_defaulted_numeric(monkeypatch):
+    """A field whose default is None must still coerce numbers, not keep a string."""
+    monkeypatch.setenv("QVA_SESSION_MAX_SECONDS", "10")
+    monkeypatch.setenv("QVA_SESSION_MAX_TURNS", "3")
+    monkeypatch.setenv("QVA_SESSION_IDLE_TIMEOUT_S", "none")
+    cfg = VoiceAgentConfig.from_env()
+    assert cfg.session.max_seconds == 10
+    assert isinstance(cfg.session.max_seconds, (int, float))
+    assert cfg.session.max_turns == 3
+    assert cfg.session.idle_timeout_s is None
+
+
+def test_idle_timeout_defaults_to_none():
+    assert VoiceAgentConfig().session.idle_timeout_s is None
+

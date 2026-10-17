@@ -66,6 +66,8 @@ class FileSource:
         self.loop = loop
 
     def frames(self) -> Iterator[AudioFrame]:
+        if self.samples.size == 0:
+            raise ValueError("FileSource: the WAV contains no audio samples")
         while True:
             yield from iter_frames(self.samples, self.sample_rate, self.frame_samples)
             if not self.loop:
@@ -154,6 +156,8 @@ class SyntheticSource:
         return np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
 
     def frames(self) -> Iterator[AudioFrame]:
+        if self._samples.size == 0:
+            raise ValueError("SyntheticSource: no segments were configured")
         while True:
             yield from iter_frames(self._samples, self.sample_rate, self.frame_samples)
             if not self.loop:

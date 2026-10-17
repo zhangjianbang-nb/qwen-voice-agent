@@ -66,11 +66,11 @@ class VoiceMemory:
         return utt
 
     def recent(self, n: int = 10) -> List[VoiceUtterance]:
-        return self._cache[-n:]
+        return self._cache[-n:] if n > 0 else []
 
     def utterances_for(self, person_id: str, limit: int = 20) -> List[VoiceUtterance]:
         hits = [u for u in self._cache if u.person_id == person_id]
-        return hits[-limit:]
+        return hits[-limit:] if limit > 0 else []
 
     def known_people(self) -> List[str]:
         return sorted({u.person_id for u in self._cache})

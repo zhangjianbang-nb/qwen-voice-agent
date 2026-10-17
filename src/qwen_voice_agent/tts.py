@@ -27,7 +27,7 @@ from typing import Optional, Protocol
 
 import numpy as np
 
-from .audio import AudioFrame, read_wav
+from .audio import AudioFrame, _decode_pcm, read_wav
 from .config import TTSConfig
 
 __all__ = ["TtsBackend", "TtsError", "HttpTts", "CommandTts", "MockTts", "NullTts", "build_tts"]
@@ -42,18 +42,34 @@ class TtsBackend(Protocol):
         ...
 
 
+def _bytes_audio_format(data: bytes) -> Optional[int]:
+    """WAV ``audioFormat`` code from raw bytes (None if not a RIFF/WAVE header)."""
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    i = 12
+    while i + 8 <= len(data):
+        cid = data[i : i + 4]
+        size = int.from_bytes(data[i + 4 : i + 8], "little")
+        if cid == b"fmt ":
+            return int.from_bytes(data[i + 8 : i + 10], "little")
+        i += 8 + size + (size & 1)
+    return None
+
+
 def _parse_wav_bytes(data: bytes, fallback_sr: int) -> AudioFrame:
-    """Decode WAV bytes into an AudioFrame; fall back to raw int16 PCM."""
+    """Decode WAV bytes into an AudioFrame; fall back to raw int16 PCM.
+
+    Uses the RIFF ``audioFormat`` code to tell float32 from int32, so a float32
+    body from a TTS server is not decoded as int32 garbage.
+    """
+    fmt = _bytes_audio_format(data)
     try:
         with wave.open(io.BytesIO(data), "rb") as wf:
-            n_ch, width, sr, n = wf.getnchannels(), wf.getsampwidth(), wf.getframerate(), wf.getnframes()
-            raw = wf.readframes(n)
-        dtype = {1: np.uint8, 2: np.int16, 4: np.int32}.get(width, np.int16)
-        arr = np.frombuffer(raw, dtype=dtype).astype(np.float32)
-        if width == 1:
-            arr = (arr - 128.0) / 128.0
-        else:
-            arr = arr / float(2 ** (8 * width - 1))
+            n_ch = wf.getnchannels()
+            width = wf.getsampwidth()
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        arr = _decode_pcm(raw, width, is_float=(fmt == 3))
         if n_ch > 1:
             arr = arr.reshape(-1, n_ch).mean(axis=1)
         return AudioFrame(arr, sr)
@@ -97,8 +113,9 @@ class HttpTts:
 class CommandTts:
     """Run an external CLI that writes a WAV file, then read it back.
 
-    ``cfg.command`` is a template containing ``{out}`` (and optionally
-    ``{text}``), e.g. ``piper --model x.onnx -f {out}`` with the text on stdin.
+    ``cfg.command`` is a template containing ``{out}`` only, e.g.
+    ``piper --model x.onnx -f {out}``.  The text is passed on **stdin**, never
+    interpolated into the command, so LLM/ASR text cannot inject shell syntax.
     """
 
     def __init__(self, cfg: TTSConfig) -> None:
@@ -110,7 +127,13 @@ class CommandTts:
         fd, out_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         try:
-            cmd = self.cfg.command.format(out=out_path, text=text)
+            try:
+                cmd = self.cfg.command.format(out=out_path)
+            except KeyError as exc:
+                raise TtsError(
+                    f"unsupported placeholder in TTS command template: {exc}; "
+                    "use {out} only — the text is passed on stdin"
+                )
             proc = subprocess.run(
                 cmd,
                 shell=True,

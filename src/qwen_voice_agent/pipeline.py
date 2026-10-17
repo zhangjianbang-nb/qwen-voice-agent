@@ -9,17 +9,29 @@ The mechanism:
 * :meth:`Pipeline.feed` is called once per audio frame by the driving loop.  It
   never blocks on generation.
 * When a :class:`~qwen_voice_agent.vad.Segmenter` closes an utterance, a
-  **generation worker thread** is started; the pipeline enters ``GENERATING`` and
-  the main loop keeps feeding frames.
+  **generation worker thread** is started with its *own* cancel event; the
+  pipeline enters ``GENERATING`` and the main loop keeps feeding frames.
 * While ``GENERATING``, if the VAD reports ``start_frames`` consecutive speech
-  frames, the worker's cancel event is set: the worker stops at its next
+  frames, that worker's cancel event is set: the worker stops at its next
   checkpoint, the pipeline returns to ``LISTENING``, and the frame that triggered
   the barge-in starts a fresh utterance.
+* A worker that outlives ``session.worker_timeout_s`` is cancelled too, so a
+  stuck ASR/LLM call cannot freeze the loop forever.
 * A finished worker appends its :class:`Turn` to a thread-safe queue; ``feed``
   drains it on the next call, so generation and listening are decoupled.
 
+Each worker gets its own cancel event (not a shared one) precisely because a
+second utterance can close before the first worker finishes: a shared event would
+be replaced and the older worker would never observe the cancellation.
+
 Every completed turn is handed to the :class:`~qwen_voice_agent.memory.MemoryManager`
 exactly once, on the thread that drains it.
+
+Note on interruption granularity: cancel is checked *between* stages and before
+``sink.play``.  A backend whose ``play`` blocks (e.g. ``sounddevice``) cannot be
+interrupted mid-sample by this layer; such a sink must stop itself when its own
+cancellation is requested.  The ``null``/``file`` sinks used in tests return
+immediately.
 """
 
 from __future__ import annotations
@@ -27,7 +39,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterator, List, Optional
+from typing import Iterator, List, Optional, Tuple
 
 import numpy as np
 
@@ -68,7 +80,7 @@ class Turn:
 
 
 class Pipeline:
-    """Full-duplex: listen while generating, stop instantly on barge-in."""
+    """Full-duplex: listen while generating, stop on barge-in or worker timeout."""
 
     def __init__(
         self,
@@ -95,12 +107,14 @@ class Pipeline:
 
         self._state = PipelineState.LISTENING
         self._barge_run = 0
-        self._worker: Optional[threading.Thread] = None
-        self._cancel = threading.Event()
+        self._barge_frames: List[Tuple[AudioFrame, float]] = []
+        self._workers: List[threading.Thread] = []
+        self._cancel = threading.Event()      # the *current* worker's event
+        self._worker_started = 0.0
         self._completed: List[Turn] = []
+        self._errors: List[BaseException] = []
         self._lock = threading.Lock()
         self._turn_index = 0
-        self._error: Optional[BaseException] = None
 
     # ---- public --------------------------------------------------------
     @property
@@ -110,9 +124,32 @@ class Pipeline:
     def feed(self, frame: AudioFrame) -> List[Turn]:
         """Feed one frame; return any turns completed as a result (usually none)."""
         prob = self.vad.speech_prob(frame)
+
         if self._state == PipelineState.GENERATING:
-            return self._feed_generating(frame, prob)
-        return self._feed_listening(frame, prob)
+            if prob >= self.cfg.vad.speech_prob:
+                self._barge_run += 1
+                self._barge_frames.append((frame, prob))
+                if self._barge_run >= self.cfg.vad.start_frames:
+                    # Barge-in: cancel the worker, then replay every frame that
+                    # confirmed the interruption into the segmenter so the
+                    # opening syllables of the user's new utterance are not lost.
+                    self._cancel.set()
+                    self._state = PipelineState.LISTENING
+                    self._barge_run = 0
+                    self.segmenter.reset()
+                    pending, self._barge_frames = self._barge_frames, []
+                    for f, p in pending:
+                        self._maybe_start(f, p)
+            else:
+                self._barge_run = 0
+                self._barge_frames = []
+            self._check_worker_timeout()
+            if self._has_completed():
+                self._state = PipelineState.LISTENING
+        else:
+            self._maybe_start(frame, prob)
+
+        return self._drain()
 
     def run(self, source: AudioSource) -> Iterator[Turn]:
         """Drive the pipeline from a source, yielding each completed turn."""
@@ -120,76 +157,66 @@ class Pipeline:
             for turn in self.feed(frame):
                 yield turn
         # Drain anything still in flight at end of stream.
-        self._join_worker()
+        self._join_workers()
         for turn in self._drain():
             yield turn
         tail = self.segmenter.flush()
         if tail is not None:
-            for turn in self._process_now(tail):
+            self._process_now(tail)
+            for turn in self._drain():
                 yield turn
 
     def close(self) -> None:
-        """Cancel any in-flight worker and wait for it, then close the sink."""
+        """Cancel any in-flight workers, wait for them, flush turns, close the sink."""
         self._cancel.set()
-        self._join_worker()
+        self._join_workers()
+        try:
+            self._drain()
+        except Exception:
+            pass
         try:
             self.sink.close()
         except Exception:
             pass
 
-    # ---- listening -----------------------------------------------------
-    def _feed_listening(self, frame: AudioFrame, prob: float) -> List[Turn]:
+    # ---- state helpers -------------------------------------------------
+    def _maybe_start(self, frame: AudioFrame, prob: float) -> None:
         utt = self.segmenter.push(frame, prob)
-        if utt is None:
-            return []
-        self._start_worker(utt)
-        self._state = PipelineState.GENERATING
-        self._barge_run = 0
-        return []
-
-    # ---- generating ----------------------------------------------------
-    def _feed_generating(self, frame: AudioFrame, prob: float) -> List[Turn]:
-        out: List[Turn] = []
-        if prob >= self.cfg.vad.speech_prob:
-            self._barge_run += 1
-            if self._barge_run >= self.cfg.vad.start_frames:
-                # Barge-in: stop the agent, then treat this frame as the start of
-                # a fresh utterance.
-                self._cancel.set()
-                self._state = PipelineState.LISTENING
-                self._barge_run = 0
-                self.segmenter.reset()
-                out.extend(self._drain())
-                out.extend(self._feed_listening(frame, prob))
-                return out
-        else:
+        if utt is not None:
+            self._start_worker(utt)
+            self._state = PipelineState.GENERATING
             self._barge_run = 0
 
-        if self._has_completed():
-            self._state = PipelineState.LISTENING
-            out.extend(self._drain())
-        return out
+    def _check_worker_timeout(self) -> None:
+        alive = [t for t in self._workers if t.is_alive()]
+        if alive and (time.monotonic() - self._worker_started) > self.cfg.session.worker_timeout_s:
+            self._cancel.set()
 
     # ---- worker --------------------------------------------------------
     def _start_worker(self, utt: Utterance) -> None:
-        self._cancel = threading.Event()
-        self._worker = threading.Thread(
-            target=self._worker_body, args=(utt,), name="qva-generate", daemon=True
+        # Reap finished threads so the list does not grow unboundedly.
+        self._workers = [t for t in self._workers if t.is_alive()]
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._worker_started = time.monotonic()
+        t = threading.Thread(
+            target=self._worker_body, args=(utt, cancel), name="qva-generate", daemon=True
         )
-        self._worker.start()
+        self._workers.append(t)
+        t.start()
 
-    def _worker_body(self, utt: Utterance) -> None:
+    def _worker_body(self, utt: Utterance, cancel: threading.Event) -> None:
         try:
             transcript = self.asr.transcribe(utt.as_frame())
             ident = None
-            if self.voiceprints is not None and not self._cancel.is_set():
+            if self.voiceprints is not None and not cancel.is_set():
                 ident = self.voiceprints.identify(utt.as_frame())
             person_id = ident.person_id if ident and ident.accepted else None
             person_name = ident.name if ident and ident.accepted else "there"
 
             reply = ""
             audio = None
-            interrupted = self._cancel.is_set()
+            interrupted = cancel.is_set()
             if not interrupted:
                 context = self.memory.context_block(person_name, transcript)
                 system_prompt = render_system_prompt(self.cfg.llm, person_name, context)
@@ -198,62 +225,65 @@ class Pipeline:
                     {"role": "user", "content": transcript},
                 ]
                 reply = self.llm.chat(messages)
-                interrupted = self._cancel.is_set()
+                interrupted = cancel.is_set()
             if not interrupted:
                 audio = self.tts.synthesize(reply)
-                interrupted = self._cancel.is_set()
+                interrupted = cancel.is_set()
             if not interrupted:
                 self.sink.play(audio)
 
-            turn = self._build_turn(utt, transcript, reply, ident, audio, interrupted)
+            turn = Turn(
+                index=self._next_index(),
+                person_id=person_id,
+                person_name=person_name,
+                user_text=transcript,
+                reply=reply,
+                embedding=(ident.embedding if ident else None),
+                identification_score=(ident.score if ident else None),
+                started_s=utt.start_s,
+                ended_s=utt.end_s,
+                interrupted=interrupted,
+                audio=audio,
+            )
             with self._lock:
                 self._completed.append(turn)
         except BaseException as exc:  # surfaced to the main thread on drain
             with self._lock:
-                self._error = exc
+                self._errors.append(exc)
 
-    def _build_turn(self, utt, transcript, reply, ident, audio, interrupted) -> Turn:
+    def _next_index(self) -> int:
         with self._lock:
             idx = self._turn_index
             self._turn_index += 1
-        return Turn(
-            index=idx,
-            person_id=(ident.person_id if ident and ident.accepted else None),
-            person_name=(ident.name if ident and ident.accepted else "there"),
-            user_text=transcript,
-            reply=reply,
-            embedding=(ident.embedding if ident else None),
-            identification_score=(ident.score if ident else None),
-            started_s=utt.start_s,
-            ended_s=utt.end_s,
-            interrupted=interrupted,
-            audio=audio,
-        )
+        return idx
 
     # ---- drain / sync --------------------------------------------------
     def _has_completed(self) -> bool:
         with self._lock:
-            return bool(self._completed) or self._error is not None
+            return bool(self._completed) or bool(self._errors)
 
     def _drain(self) -> List[Turn]:
         with self._lock:
             turns = self._completed
             self._completed = []
-            err = self._error
-            self._error = None
-        if err is not None:
-            raise err
+            errors = self._errors
+            self._errors = []
+        if errors:
+            raise errors[0]
         for turn in turns:
             self.memory.observe(turn)
         return turns
 
-    def _join_worker(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            self._worker.join(timeout=max(5.0, self.cfg.session.worker_timeout_s))
-        self._worker = None
+    def _join_workers(self, timeout: Optional[float] = None) -> None:
+        if timeout is None:
+            timeout = max(5.0, self.cfg.session.worker_timeout_s)
+        for t in list(self._workers):
+            if t.is_alive():
+                t.join(timeout=timeout)
+        self._workers = [t for t in self._workers if t.is_alive()]
 
-    def _process_now(self, utt: Utterance) -> List[Turn]:
+    def _process_now(self, utt: Utterance) -> None:
         """Process an utterance synchronously (used only for the tail flush)."""
-        self._cancel = threading.Event()
-        self._worker_body(utt)
-        return self._drain()
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._worker_body(utt, cancel)

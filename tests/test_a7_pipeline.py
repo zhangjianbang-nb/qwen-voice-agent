@@ -105,16 +105,21 @@ def test_pipeline_records_turn_in_memory(tmp_path):
 def test_barge_in_stops_generation(tmp_path):
     cfg = VoiceAgentConfig()
     cfg.vad.min_speech_ms = 200.0
-    p = _make(cfg, SlowTts(delay=0.5), tmp_path)
+    p = _make(cfg, SlowTts(delay=0.6), tmp_path)
     _open_and_close(p)
     assert p.state == PipelineState.GENERATING, f"expected generating, got {p.state}"
 
     # The user speaks again: barge-in must fire within start_frames frames.
     for _ in range(cfg.vad.start_frames):
         p.feed(_tone())
-
     assert p.state == PipelineState.LISTENING
     assert p._cancel.is_set()
+
+    # The in-flight worker must actually stop, not merely be flagged.
+    deadline = time.time() + 3.0
+    while time.time() < deadline and any(t.is_alive() for t in p._workers):
+        time.sleep(0.02)
+    assert not any(t.is_alive() for t in p._workers), "worker thread did not stop after barge-in"
     p.close()
 
 
@@ -152,4 +157,30 @@ def test_pipeline_run_over_synthetic_source(tmp_path):
             break
     assert len(turns) >= 2
     assert [t.index for t in turns] == list(range(len(turns)))
+    p.close()
+
+
+class HangingTts:
+    """Never returns within the test window, simulating a stuck worker."""
+
+    def synthesize(self, text: str) -> AudioFrame:
+        time.sleep(3.0)
+        return AudioFrame(np.zeros(1600, dtype=np.float32), SR)
+
+
+def test_worker_timeout_cancels_stuck_worker(tmp_path):
+    cfg = VoiceAgentConfig()
+    cfg.vad.min_speech_ms = 200.0
+    cfg.session.worker_timeout_s = 0.15
+    p = _make(cfg, HangingTts(), tmp_path)
+    _open_and_close(p)
+    assert p.state == PipelineState.GENERATING
+
+    t0 = time.time()
+    while time.time() - t0 < 2.0:
+        p.feed(_silence())
+        if p._cancel.is_set():
+            break
+        time.sleep(0.01)
+    assert p._cancel.is_set(), "worker_timeout_s did not cancel a stuck worker"
     p.close()

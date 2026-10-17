@@ -137,6 +137,9 @@ class OnnxEmbedding:
         if frame.sample_rate != _EMBED_SR:
             x = resample(x, frame.sample_rate, _EMBED_SR)
         feat = _log_mel(x, _EMBED_SR, n_mels=80).T[None, :, :].astype(np.float32)
+        # Shape (1, n_frames, 80): the (batch, time, freq) layout most ECAPA /
+        # WeSpeaker / 3D-Speaker ONNX exports expect.  A checkpoint that wants
+        # (batch, freq, time) needs a transpose here — model-specific.
         out = self._sess.run([self._out], {self._in: feat})[0]
         vec = np.asarray(out).reshape(-1).astype(np.float32)
         self.dim = vec.size

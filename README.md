@@ -92,6 +92,12 @@ listening are decoupled through a thread-safe queue, so neither blocks the other
 | **episodic** | JSONL | What happened ("at 14:03 Ada asked about the weather") |
 | **procedural** | JSON | How to behave ("lead with the answer") |
 
+> **Voiceprint caveat.** The default `voiceprint.backend="mel"` is a deterministic
+> *placeholder*, not a trained speaker model — it ranks clips by spectral envelope
+> and does **not** reliably reject a stranger. Set `voiceprint.backend="onnx"`
+> (ECAPA / WeSpeaker / 3D-Speaker) for real identification, and calibrate
+> `threshold` on enrolment audio.
+
 `MemoryManager.context_block(person, query)` assembles what fits in a **character
 budget** (`context_budget_chars`) — highest-priority blocks first — so latency does
 not grow with conversation length. The memory layer never depends on a tokenizer.
@@ -105,7 +111,7 @@ The suite encodes eight acceptance criteria (see `docs/DESIGN.md`):
 | A1 | Core imports pull in no heavy dependency |
 | A2 | Config round-trips; env overrides work; unknown keys raise |
 | A3 | VAD segments real speech; both energy and Silero backends fire |
-| A4 | Voiceprint enrol/identify: self ≈ 1.0, others lower, full ranking returned |
+| A4 | Voiceprint enrol/identify: self > 0.99, other clips score strictly lower, full ranking returned |
 | A5 | ASR/TTS/LLM backends behave; HTTP backends fail loudly, never hang |
 | A6 | Five stores round-trip; `context_block` respects its budget |
 | A7 | Full-duplex: turns are produced; barge-in cancels generation |

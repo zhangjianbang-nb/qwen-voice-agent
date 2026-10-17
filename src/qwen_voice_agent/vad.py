@@ -125,12 +125,20 @@ class SileroVad:
             low = name.lower()
             if "sr" in low or "rate" in low:
                 feed[name] = sr
-            elif low == "h" or "h_" in low:
+            elif low == "h" or low.startswith("h_"):
                 feed[name] = self._h
-            elif low == "c" or "c_" in low:
+            elif low == "c" or low.startswith("c_"):
                 feed[name] = self._c
-            else:
+            elif "input" in low or low in ("x", "waveform"):
                 feed[name] = inp
+            else:
+                # Refuse rather than silently feed audio into an unknown slot
+                # (e.g. a v4 combined `state` tensor) — a shape mismatch here
+                # would surface far from the cause.
+                raise RuntimeError(
+                    f"unsupported Silero input {name!r}; this build expects the "
+                    "h/c recurrent-state variant with inputs (input, sr, h, c)"
+                )
         outs = self._sess.run(self._out_names, feed)
         by_name = dict(zip(self._out_names, outs))
         prob = 0.0
@@ -263,10 +271,13 @@ class Segmenter:
         samples = np.concatenate(self._collected) if self._collected else np.zeros(0, np.float32)
         probs = self._probs or [0.0]
         end_s = self._t
+        # Derive the start from the sample count so start_s/end_s and the audio
+        # length agree (the segment includes the pre-roll).
+        start_s = max(0.0, end_s - samples.size / float(self.sample_rate))
         utt = Utterance(
             samples=np.ascontiguousarray(samples, dtype=np.float32),
             sample_rate=self.sample_rate,
-            start_s=self._start_s,
+            start_s=start_s,
             end_s=end_s,
             peak_prob=float(max(probs)),
             mean_prob=float(np.mean(probs)),

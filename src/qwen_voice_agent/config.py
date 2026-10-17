@@ -178,14 +178,17 @@ class MemoryConfig:
 class SessionConfig:
     """The 24/7 supervision loop.
 
-    `worker_timeout_s` is the point at which a generation worker is considered
-    stuck and its cancellation event is set.  Without it a hung LLM request
-    would freeze the turn loop forever, which is the single most common way a
-    long-running voice agent dies quietly.
+    ``max_seconds`` / ``max_turns`` are optional bounds (``None`` == run forever,
+    the real 24/7 mode).  ``idle_timeout_s`` is also optional and defaults to
+    ``None`` so a silent-but-alive agent is not killed; set it if you want an idle
+    exit.  ``worker_timeout_s`` is the point at which a generation worker is
+    considered stuck and its cancellation event is set.  Without it a hung LLM
+    request would freeze the turn loop forever, which is the single most common
+    way a long-running voice agent dies quietly.
     """
 
     max_seconds: Optional[float] = None  # None == run forever
-    idle_timeout_s: float = 300.0
+    idle_timeout_s: Optional[float] = None  # None == never exit on idleness
     worker_timeout_s: float = 90.0
     maintenance_interval_s: float = 30.0
     max_turns: Optional[int] = None
@@ -284,7 +287,14 @@ class VoiceAgentConfig:
 
 
 def _coerce(raw: str, reference: Any) -> Any:
-    """Coerce an environment string to the type of the field it overrides."""
+    """Coerce an environment string to the type of the field it overrides.
+
+    For a field whose default is ``None`` (``max_seconds``, ``max_turns``,
+    ``idle_timeout_s``, ``model_path`` ...) the target type is unknown, so we try
+    int, then float, then leave the string; ``none``/``null``/empty mean ``None``.
+    Without this, ``QVA_SESSION_MAX_SECONDS=10`` would become the *string* "10"
+    and crash the loop at the first comparison.
+    """
     if isinstance(reference, bool):
         return raw.strip().lower() in {"1", "true", "yes", "on"}
     if isinstance(reference, int):
@@ -294,6 +304,14 @@ def _coerce(raw: str, reference: Any) -> Any:
     if isinstance(reference, list):
         return [item for item in raw.split(",") if item != ""]
     if reference is None:
+        s = raw.strip()
+        if s.lower() in {"", "none", "null"}:
+            return None
+        for cast in (int, float):
+            try:
+                return cast(s)
+            except ValueError:
+                continue
         return raw
     return raw
 

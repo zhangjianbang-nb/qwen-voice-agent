@@ -1,5 +1,7 @@
 """A5 — the inference backends behave behind their protocols."""
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -76,3 +78,28 @@ def test_http_llm_fails_loudly():
     cfg = LLMConfig(backend="http", base_url="http://127.0.0.1:1/v1", timeout_s=1.0)
     with pytest.raises(LlmError):
         HttpLlm(cfg).chat([{"role": "user", "content": "hi"}])
+
+
+def test_command_tts_runs_external_cli(tmp_path):
+    """The command backend runs a real subprocess and reads its WAV back."""
+    script = tmp_path / "fake_tts.py"
+    script.write_text(
+        "import sys, wave, struct\n"
+        "out = sys.argv[1]\n"
+        "n = 1600\n"
+        "data = struct.pack('<%dh' % n, *([0] * n))\n"
+        "w = wave.open(out, 'wb')\n"
+        "w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)\n"
+        "w.writeframes(data); w.close()\n"
+    )
+    cfg = TTSConfig(backend="command", command=f"{sys.executable} {script} {{out}}")
+    out = build_tts(cfg).synthesize("hello")
+    assert isinstance(out, AudioFrame)
+    assert len(out) == 1600
+
+
+def test_command_tts_rejects_text_placeholder(tmp_path):
+    """A template using {text} is refused (the text goes on stdin, not the shell)."""
+    cfg = TTSConfig(backend="command", command="echo {text} > {out}")
+    with pytest.raises(TtsError):
+        build_tts(cfg).synthesize("hello")

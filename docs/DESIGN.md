@@ -80,7 +80,7 @@ class EnergyVad:  ...   # 相对自适应噪声底的能量比（不是绝对电
 class SileroVad:  ...   # onnxruntime；h/c 为 LSTM 状态（2×1×64），非单 state 张量
 
 class Segmenter:         # 迟滞：start_frames 开、end_frames 关（end 更大）
-    def push(self, frame) -> Optional[Utterance]  # 返回闭合的整段话
+    def push(self, frame, prob) -> Optional[Utterance]  # 帧 + 其语音概率，返回闭合的整段话
 ```
 
 **Silero v5 ONNX contract（已探明）**：输入 `input[batch,seq] f32, sr[] i64, h[2,batch,64] f32, c[2,batch,64] f32`；输出 `output[batch,1], hn, cn`。**LSTM 状态是 h/c 两个张量**，喂 `{"input","state","sr"}` 会失败。
@@ -134,19 +134,25 @@ class AudioSink(Protocol):
 # FileSink | SpeakerSink(extra) | NullSink
 
 # pipeline.py —— 全双工状态机
-states: IDLE → LISTENING → THINKING → SPEAKING → LISTENING ...
-barge-in: SPEAKING 期间若 VAD 判定用户开口 → 立即 cancel 生成 worker + 停止 TTS → 回到 LISTENING
-worker: LLM+TTS 在独立线程生成；主循环持续读帧做 VAD，实现"边说边听"
+states: LISTENING ↔ GENERATING
+barge-in: GENERATING 期间若 VAD 连续 start_frames 帧判定为语音 → set **当前 worker 自己的** cancel event
+          → 回到 LISTENING，触发打断的那帧开启新话
+worker: 每个闭合的 utterance 起一个独立 worker 线程（各自持有 cancel event，
+        不是共享对象——否则第二个 worker 一启动就会替换掉第一个的 event）
+worker_timeout: worker 存活超过 session.worker_timeout_s → 被 cancel（防卡死）
+drain: worker 完成把 Turn 放进线程安全队列；主循环每帧 drain 一次（含 barge-in 残留）
 class Pipeline:
-    def run_turn_loop(self) -> Iterator[Turn]   # 每个完成的 Turn 产出
+    def feed(frame) -> List[Turn]       # 喂一帧，返回本轮完成的 Turn
+    def run(source) -> Iterator[Turn]   # 驱动 source，产出每个 Turn
 
 # session.py —— 24h 监督
 class VoiceSession:
     def run(self) -> None
-    # - max_seconds=None 表示永久；idle_timeout_s 无输入超时；
-    # - worker_timeout_s 卡死 worker 的取消点（长跑 agent 最常见的静默死法）；
-    # - maintenance_interval_s 周期性维护（记忆压缩/落盘）；
-    # - SIGTERM/SIGINT → 优雅退出（保存记忆、停 TTS、关 source）
+    # - max_seconds/max_turns 可界定（None = 永久）；
+    # - idle_timeout_s 默认 None（不因空闲退出）；
+    # - worker_timeout_s 卡死 worker 的取消点；
+    # - maintenance_interval_s 周期性维护（记忆 prune）；
+    # - SIGTERM/SIGINT → 优雅退出（停 TTS/sink、flush 记忆、关 source）
 ```
 
 ## 5. 验收标准 A1–A8（可编程断言）
@@ -156,7 +162,7 @@ class VoiceSession:
 | **A1** | 核心零重依赖 | 新 venv 仅装 numpy 后 `import qwen_voice_agent` 及其全部核心模块成功；`sys.modules` 不含 torch/scipy/onnxruntime/sounddevice |
 | **A2** | 配置系统 | `to_json/from_json_file` 往返相等；`QVA_*` env 覆盖生效（含 bool/int/float/list 类型强转）；未知键**抛异常**而非静默丢弃 |
 | **A3** | VAD 分段 | 用真实语音 WAV（`ref_minicpm_signature.wav`）跑 `Segmenter`，切出 ≥1 段、段长在 `min_speech_ms..max_speech_ms`、静音段被排除；能量后端与 Silero 后端都能给出 >0.5 的语音概率 |
-| **A4** | 声纹识别 | 同一段音频注册后自识别 cosine≈1.0；不同音频（另一 WAV 的片段）识别分低于阈值；`identify` 返回完整排名 |
+| **A4** | 声纹识别 | 同一段音频注册后自识别 cosine>0.99；另一段音频得分**严格低于**自识别分；`identify` 返回完整排名（默认 mel 后端是确定性占位，**不保证拒识陌生人**——拒识需 onnx 后端） |
 | **A5** | 推理后端协议 | mock/scripted/http 三种 ASR 后端各自 `transcribe` 返回 str；mock/command TTS 返回 AudioFrame；mock LLM `chat` 返回 str；http 后端在无服务时给出清晰异常而非挂死 |
 | **A6** | 五类记忆 | 五个 store 各自读写 round-trip；`MemoryManager.observe` 后 `context_block` 含该轮信息且长度 ≤ `context_budget_chars`；语义事实可存可查 |
 | **A7** | 全双工 + barge-in | 用合成脚本音频驱动 pipeline：TTS 播放中注入"用户说话"帧 → 生成 worker 被 cancel、TTS 停止、状态回 LISTENING；产出 Turn 序列正确 |
@@ -169,8 +175,35 @@ class VoiceSession:
 1. **无麦克风** → 真实实时监听无法在本机跑。验收用 file source + 真实 WAV 覆盖 A3/A4/A7；mic 路径只做代码级审查 + doctor 探活。
 2. **无 GPU torch** → 本地 transformers ASR/TTS 不可用；`http` backend 是生产路径，测试用 mock/scripted。
 3. **无 ASR/TTS 模型** → 需定位或下载 Qwen ASR / Qwen TTS（候选：`Qwen3-ASR`、`CosyVoice2`/`Qwen3-TTS`）与声纹模型（`3D-Speaker`/`WeSpeaker`/ECAPA）。**本机可先不下载**，架构用 mock 打通；下载为后续增强项。
-4. **阈值未标定** → `voiceprint.threshold=0.75` 是起点不是标定值，必须用真实注册音频按后端调。
+4. **声纹后端与阈值** → 默认 `voiceprint.backend="mel"` 是**确定性占位**（log-mel 统计池化），只按频谱包络区分音频，**不保证拒识陌生人**、对同一人不同话不鲁棒；生产须换 `onnx`（ECAPA / WeSpeaker / 3D-Speaker）并按真实注册音频标定 `threshold`（默认 0.75 只是起点）。
 
-## 7. 外部评审
+## 7. 外部评审（2026-10-17）
 
-按用户铁律，架构设计类任务须与 ChatGPT 对齐。评审结论回写本文件（标注"外部评审 YYYY-MM-DD"），全文归档 `docs/chatgpt-review-full.txt`。
+按用户铁律，架构设计类任务须与 ChatGPT 对齐。已将设计决策与自担风险点发给 ChatGPT 评审，全文归档 `docs/chatgpt-review-full.txt`（25.8K 字符）。
+
+**评审总评**：架构方向合理 —— 模块划分、backend protocol、mock/scripted 后端、五类记忆分类、限时运行/优雅退出/周期维护均应保留。真正的难点不在记忆分层，而在**实时音频控制权、任务生命周期、长跑资源回收**。
+
+**评审 P0 项在本版的处理**：
+
+| P0 项 | 状态 |
+|-------|------|
+| 取消生成 ≠ 停止播放（需独立 AudioOutputController） | **未修**（`sink.play` 仍阻塞不可中断，见 §8） |
+| 任务 ID 防止旧任务污染新任务 | 部分（每个 worker 持有独立 cancel event；尚无跨阶段 task_id 校验） |
+| 音频采集与生成执行隔离 | 已满足（生成在独立 worker 线程；主循环只读帧做 VAD，不被后端阻塞） |
+| 有界队列与过载策略 | 已满足（drain 队列 + worker 回收 + ring buffer 有界 + 空源不再忙循环） |
+| 阻塞后端的取消/超时契约 | 部分（`worker_timeout_s` 已真正 cancel 卡死 worker；HTTP 后端带 timeout；但 `threading.Event` 无法强杀阻塞调用） |
+| 打断音频前置缓冲 | **已修**（barge-in 时把确认打断的帧重放给 Segmenter，不丢开头音节） |
+
+评审另给出三个验收实验（打断正确性 / 阻塞后端恢复 / 24h 故障注入）与长跑指标清单（`barge_in_stop_ms`、`queue_depth`、`worker_active_count`、`rss_bytes` 等），作为后续工作。
+
+## 8. Roadmap / 已知限制（外部评审 2026-10-17 驱动）
+
+本版是**可测试的原型**，以下为评审指出、尚未实现的能力，按优先级：
+
+- **P0 AudioOutputController**：把播放从生成 worker 剥离为独立、可分块取消的输出控制器，使 barge-in 能真正停止正在播放的 TTS（当前 `sink.play` 阻塞不可中断；`null`/`file` sink 立即返回，故不影响测试）。
+- **P0 任务 ID**：每次对话分配 `task_id`，所有异步结果提交前校验，丢弃旧任务的迟到结果。
+- **P1 回声抑制 / 双讲检测**：Agent 播放时的自我打断需 AEC + 播放参考信号，不能只靠 VAD 阈值。
+- **P1 设备健康检查与恢复**：区分「无设备 / 初始化失败 / 运行中断开 / 无有效输入」，进入明确故障态而非假装监听。
+- **P1 记忆锁粒度 / JSONL 恢复轮转**：锁外快照 + 专用写者 + 尾部不完整记录恢复 + 文件轮转。
+- **P2 声纹模型与阈值校准**、**Token 预算与相关性排序**、**后端共享契约测试**。
+

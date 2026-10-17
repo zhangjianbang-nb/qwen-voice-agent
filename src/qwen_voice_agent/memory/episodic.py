@@ -49,11 +49,11 @@ class EpisodicMemory:
         return ep
 
     def recent(self, n: int = 10) -> List[Episode]:
-        return self._cache[-n:]
+        return self._cache[-n:] if n > 0 else []
 
     def by_kind(self, kind: str, limit: int = 20) -> List[Episode]:
         hits = [e for e in self._cache if e.kind == kind]
-        return hits[-limit:]
+        return hits[-limit:] if limit > 0 else []
 
     def __len__(self) -> int:
         return len(self._cache)

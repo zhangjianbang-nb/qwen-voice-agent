@@ -71,6 +71,7 @@ class MemoryManager:
         self.episodic = EpisodicMemory(episodic_path)
         self.procedural = ProceduralMemory(procedural_path, seed=cfg.seed_skills)
         self._lock = threading.Lock()
+        self._closed = False
 
     # ---- per-turn write ------------------------------------------------
     def observe(self, turn: Any, ts: Optional[float] = None) -> None:
@@ -86,6 +87,8 @@ class MemoryManager:
         reply = getattr(turn, "reply", "") or ""
 
         with self._lock:
+            if self._closed:
+                return
             self.working.add("user", user_text, ts=ts, person=person_name)
             self.working.add("assistant", reply, ts=ts, person=person_name)
 
@@ -95,7 +98,7 @@ class MemoryManager:
                 text=user_text,
                 ts=ts,
                 embedding=getattr(turn, "embedding", None),
-                score=getattr(turn, "asr_score", None),
+                score=getattr(turn, "identification_score", None),
             )
 
             self.episodic.append(
@@ -139,6 +142,8 @@ class MemoryManager:
         if budget == 0:
             return ""
         with self._lock:
+            if self._closed:
+                return ""
             blocks: List[str] = []
 
             # 1. identity
@@ -182,8 +187,13 @@ class MemoryManager:
     # ---- maintenance ---------------------------------------------------
     def prune(self) -> None:
         """Drop expired working items; called by the session maintenance loop."""
-        self.working.items()
+        with self._lock:
+            self.working.items()
 
     def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
         self.semantic.close()
         self.procedural.save()

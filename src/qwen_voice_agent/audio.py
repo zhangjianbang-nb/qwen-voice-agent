@@ -29,6 +29,7 @@ __all__ = [
     "resample",
     "read_wav",
     "write_wav",
+    "wav_audio_format",
     "iter_frames",
     "concat",
     "silence",
@@ -146,38 +147,94 @@ def resample(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
         return np.interp(dst, src, x.astype(np.float64)).astype(np.float32)
 
 
+def wav_audio_format(path: str) -> Optional[int]:
+    """Return the WAV ``audioFormat`` code (1 = PCM, 3 = IEEE float, 6 = A-law...).
+
+    ``wave`` does not expose this, and it is the only reliable way to tell a
+    32-bit *float* WAV from a 32-bit *int* one — a magnitude heuristic misreads a
+    quiet int file as float.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+    except OSError:
+        return None
+    if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    i = 12
+    while i + 8 <= len(head):
+        cid = head[i : i + 4]
+        size = int.from_bytes(head[i + 4 : i + 8], "little")
+        if cid == b"fmt ":
+            return int.from_bytes(head[i + 8 : i + 10], "little")
+        i += 8 + size + (size & 1)  # chunks are word-aligned
+    return None
+
+
+def _decode_pcm(raw: bytes, width: int, is_float: bool) -> np.ndarray:
+    """Decode raw WAV sample bytes into float32 in [-1, 1]."""
+    if width == 4 and is_float:
+        return np.frombuffer(raw, dtype=np.float32).astype(np.float32)
+    if width == 3:
+        # 24-bit little-endian PCM: widen each 3-byte sample to int32, sign-extend.
+        b = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        ints = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        ints = np.where(ints & 0x800000, ints - 0x1000000, ints)
+        return ints.astype(np.float32) / 8388608.0
+    dtype, scale = _WAV_WIDTHS.get(width, (np.int16, 32768.0))
+    data = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+    if width == 1:
+        return (data - 128.0) / 128.0  # unsigned 8-bit -> signed float
+    return data / scale
+
+
+def _read_wav_manual(path: str) -> tuple[int, int, int, bytes]:
+    """Minimal RIFF/WAVE parse for files the stdlib ``wave`` reader rejects.
+
+    ``wave`` only accepts PCM (``audioFormat`` 1); IEEE-float WAVs raise
+    ``wave.Error``.  This reads the fmt and data chunks directly.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if len(raw) < 12 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise ValueError(f"not a RIFF/WAVE file: {path}")
+    i = 12
+    fmt_body = None
+    data = None
+    while i + 8 <= len(raw):
+        cid = raw[i : i + 4]
+        size = int.from_bytes(raw[i + 4 : i + 8], "little")
+        body = raw[i + 8 : i + 8 + size]
+        if cid == b"fmt ":
+            fmt_body = body
+        elif cid == b"data":
+            data = body
+        i += 8 + size + (size & 1)
+    if fmt_body is None or data is None:
+        raise ValueError(f"malformed WAV (missing fmt/data chunk): {path}")
+    _afmt, n_channels, sr, _bps, _align, bits = struct.unpack_from("<HHIIHH", fmt_body)
+    width = max(1, bits // 8)
+    return int(n_channels), int(width), int(sr), data
+
+
 def read_wav(path: str) -> tuple[np.ndarray, int]:
     """Read a WAV file into ``(float32 mono samples, sample_rate)``.
 
-    Handles 8/16/32-bit PCM and 32-bit float WAVs.  Multi-channel files are
-    averaged to mono.  Only the standard library is used so this works in the
-    minimal install.
+    Handles 8/16/24/32-bit PCM and 32-bit float WAVs.  The standard-library
+    ``wave`` reader is tried first; IEEE-float WAVs (which ``wave`` rejects) fall
+    back to a small manual RIFF parse.  Multi-channel files are averaged to mono.
     """
-    with wave.open(path, "rb") as wf:
-        n_channels = wf.getnchannels()
-        width = wf.getsampwidth()
-        sr = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
+    fmt = wav_audio_format(path)
+    try:
+        with wave.open(path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            width = wf.getsampwidth()
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        n_channels, width, sr, raw = _read_wav_manual(path)
 
-    if width == 4:
-        # wave does not distinguish int32 from float32; assume float32 WAVs
-        # (the common case for generated speech) unless values look like int32.
-        as_f32 = np.frombuffer(raw, dtype=np.float32)
-        as_i32 = np.frombuffer(raw, dtype=np.int32)
-        # float32 audio lives in [-1, 1]; int32 audio exceeds it almost surely.
-        if as_f32.size and np.nanmax(np.abs(as_f32)) <= 1.5:
-            data = as_f32
-        else:
-            data = as_i32.astype(np.float32) / _WAV_WIDTHS[4][1]
-    else:
-        dtype, scale = _WAV_WIDTHS.get(width, (np.int16, 32768.0))
-        data = np.frombuffer(raw, dtype=dtype).astype(np.float32)
-        if width == 1:
-            data = (data - 128.0) / 128.0  # unsigned 8-bit -> signed float
-        else:
-            data = data / scale
-
+    data = _decode_pcm(raw, width, is_float=(fmt == 3))
     if n_channels > 1:
         data = data.reshape(-1, n_channels).mean(axis=1)
     return np.ascontiguousarray(data, dtype=np.float32), int(sr)

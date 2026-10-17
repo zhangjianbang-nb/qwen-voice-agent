@@ -79,10 +79,24 @@ def test_manager_observe_and_context_block(tmp_path):
     m = MemoryManager(cfg)
     m.observe(FakeTurn())
     ctx = m.context_block("Ada", "Beijing")
-    assert "Ada" in ctx
     assert len(ctx) <= 1200
-    # high-precision fact extraction kept the original casing
+    # The turn's actual content must reach the context, not just the identity line
+    # (which is always present even if observe() wrote nothing).
+    assert "Beijing" in ctx            # extracted fact
+    assert "Noted, Beijing." in ctx    # recent exchange (assistant reply)
     assert m.recall_fact("location") == "Beijing"
+
+
+def test_recent_zero_returns_empty(tmp_path):
+    e = EpisodicMemory(str(tmp_path / "e.jsonl"))
+    e.append("turn", {"user": "a"})
+    e.append("turn", {"user": "b"})
+    assert e.recent(0) == []
+    assert len(e.recent(2)) == 2
+    v = VoiceMemory(str(tmp_path / "v.jsonl"))
+    v.add("p1", "Ada", "hi")
+    assert v.recent(0) == []
+    assert len(v.utterances_for("p1", 0)) == 0
 
 
 def test_context_block_respects_budget(tmp_path):
