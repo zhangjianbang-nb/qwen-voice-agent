@@ -34,6 +34,12 @@ class AudioConfig:
     frame_ms: float = 20.0
     ring_seconds: float = 30.0
     input_gain: float = 1.0
+    # ALSA device names for the ``arecord`` / ``aplay`` capture and playback
+    # paths (e.g. "plughw:1,0").  ``None`` lets each tool pick its own default,
+    # which is right when the box has exactly one card; naming a device is how
+    # you keep the agent off the HDMI output when a headset is also attached.
+    input_device: Optional[str] = None
+    output_device: Optional[str] = None
 
     @property
     def frame_samples(self) -> int:
@@ -54,6 +60,15 @@ class VadConfig:
     door-slam from opening a turn; `end_frames` is deliberately the larger of the
     two because a turn that closes early is far cheaper than one that never
     closes.
+
+    `echo_guard` is the honest answer to a single-box deployment: when the agent
+    plays through the same machine's speakers, its own voice is picked up by the
+    microphone, the VAD fires, and the agent interrupts itself.  With the guard on,
+    captured frames are dropped while the agent is speaking (plus `echo_tail_ms`
+    of reverb tail), which makes the loop usable — at the price of true barge-in
+    during playback.  Wear headphones, or set this to ``False``, to get real
+    full-duplex interruption back.  Proper echo cancellation (AEC with a playback
+    reference signal) is the fix that keeps both.
     """
 
     backend: str = "energy"  # "energy" | "silero"
@@ -67,6 +82,8 @@ class VadConfig:
     min_speech_ms: float = 250.0
     max_speech_ms: float = 15000.0
     pre_roll_ms: float = 300.0
+    echo_guard: bool = False  # drop capture while the agent speaks (see above)
+    echo_tail_ms: float = 400.0  # keep dropping this long after playback ends
 
 
 @dataclass
@@ -81,7 +98,8 @@ class VoiceprintConfig:
     """
 
     enabled: bool = True
-    backend: str = "mel"  # "mel" | "onnx" | "resemblyzer"
+    # "mel" (placeholder) | "funasr" (local CAM++) | "onnx" | "resemblyzer"
+    backend: str = "mel"
     model_path: Optional[str] = None
     threshold: float = 0.75
     min_utterance_s: float = 0.6
@@ -93,6 +111,10 @@ class ASRConfig:
     """Qwen ASR backend selection.
 
     `backend`:
+      * ``funasr`` -- a **local** FunASR checkpoint (SenseVoice).  This is the
+        path this deployment runs: no server, no network, ~0.1 s per utterance
+        on CPU.  ``model_path`` names the checkpoint directory; ``None`` means
+        "use the cached ModelScope download";
       * ``http`` -- an OpenAI-compatible ``/v1/audio/transcriptions`` endpoint
         (this is how Qwen ASR is normally reached in production);
       * ``transformers`` -- a local checkpoint loaded through `transformers`;
@@ -107,24 +129,42 @@ class ASRConfig:
     language: Optional[str] = None
     timeout_s: float = 30.0
     script: List[str] = field(default_factory=list)
+    # ``funasr`` backend only: checkpoint directory, compute device, and whether
+    # to inverse-text-normalise the output (digits vs spelled-out numbers).
+    model_path: Optional[str] = None
+    device: str = "cpu"
+    use_itn: bool = True
 
 
 @dataclass
 class TTSConfig:
     """Qwen TTS backend selection.
 
-    ``http`` speaks the OpenAI ``/v1/audio/speech`` shape; ``command`` runs an
-    external CLI that writes a WAV file (this is how a local Qwen TTS or
-    `edge-tts` + ffmpeg is wired without adding a Python dependency).
+    ``http`` speaks the OpenAI ``/v1/audio/speech`` shape; ``edge`` synthesises
+    locally through the ``edge-tts`` package (no subprocess, no temp file — the
+    online voices are the best Chinese quality available here); ``command`` runs
+    an external CLI that writes a WAV file, for anything else.
+
+    ``voice`` is the backend's own voice name: an OpenAI voice for ``http``, an
+    Edge voice (``zh-CN-XiaoxiaoNeural``) for ``edge``.
+
+    ``piper`` runs the voice ONNX locally.  Synthesis is ~50 ms per sentence
+    against edge's ~1.5 s network round trip, so it is the low-latency choice, at
+    some cost in naturalness.  ``model_path`` points at the voice ``.onnx``;
+    ``model_config`` defaults to ``<model_path>.json``.  ``length_scale`` slows
+    (``>1``) or speeds (``<1``) the delivery without changing the voice.
     """
 
-    backend: str = "mock"  # "http" | "command" | "mock" | "null"
+    backend: str = "mock"  # "http" | "edge" | "piper" | "command" | "mock" | "null"
     base_url: str = "http://127.0.0.1:8000/v1"
     model: str = "qwen-tts"
     voice: str = "alloy"
     api_key: Optional[str] = None
     timeout_s: float = 30.0
     sample_rate: int = 16000
+    model_path: Optional[str] = None  # piper voice .onnx
+    model_config: Optional[str] = None  # defaults to <model_path>.json
+    length_scale: Optional[float] = None  # piper rate; 1.0 is the voice's native
     command: Optional[str] = None  # e.g. "piper --model x.onnx -f {out}"
 
 
@@ -185,6 +225,13 @@ class SessionConfig:
     considered stuck and its cancellation event is set.  Without it a hung LLM
     request would freeze the turn loop forever, which is the single most common
     way a long-running voice agent dies quietly.
+
+    ``realtime`` paces the loop to the audio's own clock: one frame of audio per
+    frame-duration of wall time.  It is on by default because without it a
+    non-blocking source (a WAV replay, or the endless silence of ``NullSource``)
+    is consumed as fast as the CPU allows — which both spins a core and makes the
+    agent deaf to its own timing.  A blocking source (microphone capture) already
+    paces itself, and the pacer then simply never sleeps.
     """
 
     max_seconds: Optional[float] = None  # None == run forever
@@ -193,6 +240,41 @@ class SessionConfig:
     maintenance_interval_s: float = 30.0
     max_turns: Optional[int] = None
     log_level: str = "INFO"
+    realtime: bool = True
+
+
+@dataclass
+class WakeConfig:
+    """Wake word and speaker gating.
+
+    Two gates, because a voice agent sharing a room with a screen needs both.
+    The **voiceprint** answers "is this my owner?" — without it every line of
+    dialogue from a nearby video becomes a turn, which is exactly what happened
+    on this machine.  The **wake word** answers "is this utterance addressed to
+    me?" — without it every overheard sentence from the owner does.
+
+    ``follow_up_s`` keeps the agent listening for a while after a wake, so a task
+    can be given across several sentences ("小丽同学…" then "把报告发我") without
+    repeating the wake word before every clause.  ``aliases`` holds the ASR
+    variants a wake word tends to come back as.
+
+    Both gates are **off by default**: the acceptance suite (A1-A8) and a plain
+    conversation assume every utterance is for the agent.  A room with a screen
+    turns them on, which is what this deployment does.
+    """
+
+    enabled: bool = False
+    wake_word: str = "小丽同学"
+    aliases: List[str] = field(default_factory=list)
+    follow_up_s: float = 8.0
+    ack: str = "在呢，你说。"
+    require_enrolled: bool = False
+    fuzzy_ratio: float = 0.75  # tolerance for the ASR mangling the wake word
+    # Barge-in is decided from VAD alone (no speaker check), so in a room with a
+    # screen every line of dialogue would cut the agent off mid-sentence.  When
+    # set, interrupting requires this many consecutive speech frames instead of
+    # `vad.start_frames`; speech from a screen rarely holds that long.
+    barge_in_frames: Optional[int] = None
 
 
 @dataclass
@@ -207,11 +289,25 @@ class VoiceAgentConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    wake: WakeConfig = field(default_factory=WakeConfig)
     # Persons enrolled ahead of time: [{"person_id": "p1", "name": "Ada"}].
     persons: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def resolve_paths(self) -> "VoiceAgentConfig":
+        """Fill in path defaults that are derived from ``memory.root``.
+
+        The voiceprint store is the one path that *must* agree between the agent
+        and the ``enroll``/``identify`` commands: if it defaults to ``None`` the
+        two silently use different files, and enrolment appears to have no effect.
+        Deriving it from the memory root makes every entry point share one store.
+        """
+        base = os.path.abspath(self.memory.root)
+        if self.voiceprint.store_path is None:
+            self.voiceprint.store_path = os.path.join(base, "voiceprints.json")
+        return self
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
@@ -317,6 +413,6 @@ def _coerce(raw: str, reference: Any) -> Any:
 
 
 def load_config(path: Optional[str] = None) -> VoiceAgentConfig:
-    """Load config from a JSON file if given, then apply `QVA_*` overrides."""
+    """Load config from a JSON file if given, apply `QVA_*` overrides, resolve paths."""
     base = VoiceAgentConfig.from_json_file(path) if path else VoiceAgentConfig()
-    return VoiceAgentConfig.from_env(base)
+    return VoiceAgentConfig.from_env(base).resolve_paths()

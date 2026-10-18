@@ -26,6 +26,9 @@ voice_utterances.jsonl
 episodic.jsonl
 procedural.json
 
+# This deployment's runtime state: memory stores, voiceprints, smoke-test audio
+/state/
+
 # Local configuration
 config.local.json
 

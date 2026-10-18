@@ -39,12 +39,30 @@ class HttpLlm:
 
     def __init__(self, cfg: LLMConfig) -> None:
         self.cfg = cfg
+        self._client = None
+
+    def _http(self):
+        """One client per process: opening a fresh client every turn pays a TCP
+        handshake and TLS setup per turn, which is pure added latency in a loop
+        that runs every few seconds."""
+        if self._client is None:
+            try:
+                import httpx  # type: ignore
+            except Exception as exc:  # pragma: no cover
+                raise LlmError("HttpLlm needs httpx installed") from exc
+            self._client = httpx.Client(timeout=self.cfg.timeout_s)
+        return self._client
+
+    def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
     def chat(self, messages: List[dict]) -> str:
-        try:
-            import httpx  # type: ignore
-        except Exception as exc:  # pragma: no cover
-            raise LlmError("HttpLlm needs httpx installed") from exc
+        client = self._http()
         url = self.cfg.base_url.rstrip("/") + "/chat/completions"
         headers = {}
         if self.cfg.api_key:
@@ -56,11 +74,10 @@ class HttpLlm:
             "max_tokens": self.cfg.max_tokens,
         }
         try:
-            with httpx.Client(timeout=self.cfg.timeout_s) as client:
-                resp = client.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-        except httpx.HTTPError as exc:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
             raise LlmError(f"LLM request to {url} failed: {exc}") from exc
         try:
             return str(data["choices"][0]["message"]["content"]).strip()

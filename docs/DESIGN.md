@@ -207,3 +207,72 @@ class VoiceSession:
 - **P1 记忆锁粒度 / JSONL 恢复轮转**：锁外快照 + 专用写者 + 尾部不完整记录恢复 + 文件轮转。
 - **P2 声纹模型与阈值校准**、**Token 预算与相关性排序**、**后端共享契约测试**。
 
+## 9. 本机部署记录（2026-10-18）
+
+仓库原型在**没有麦克风、没有 GPU、没有模型**的假设下写成（§2），本次在真实机器上接线并修正了若干在真实数据上才暴露的问题。部署细节见 `DEPLOY.md`，此处只记设计层面的变化。
+
+### 9.1 新增的真实后端
+
+| 环节 | 新后端 | 为什么 |
+|------|--------|--------|
+| ASR | `funasr`（本地 SenseVoice） | 比 HTTP 往返更快（83 ms/句），且不依赖网络 |
+| 声纹 | `funasr`（本地 CAM++） | mel 是占位、**不能拒识陌生人**；CAM++ 同人 0.69 / 陌生人 0.02 |
+| TTS | `piper`（本地 VITS ONNX） | 25–70 ms/句且完全离线；`edge` 保留为音质更好的联网备选 |
+| 采集/播放 | `arecord` / `aplay` | 免 Python 依赖；`aplay` 是唯一可真正打断的 sink |
+
+模型加载集中在 `local_models.py`：惰性导入 + 按目录缓存，保证核心仍只依赖 numpy（A1 不变）。
+
+### 9.2 真实数据上暴露并修掉的问题
+
+| # | 问题 | 后果 | 修法 |
+|---|------|------|------|
+| 1 | `SileroVad` 只接受 h/c `(2,1,64)` 契约 | 官方 `silero_vad.onnx` 是合并 `state (2,batch,128)`，被代码**拒绝加载**，故 A3 的 silero 测试在正常机器上必然 skip | 加载时探测契约，两种都支持 |
+| 2 | Silero 未拼 64 样本上下文 | 真实语音上概率只有 **0.07**（静默失败，不报错） | 按官方 `OnnxWrapper` 拼 `context(64)+chunk(512)`，概率 1.0 |
+| 3 | `VoiceSession.run` 无节拍 | `NullSource`/`FileSource` 以 CPU 速度被消费：空转一个核，WAV 回放不像实时流 | 按音频时钟节拍（`session.realtime`） |
+| 4 | 单轮失败会终止会话 | 一个死掉的后端能结束"24/7"进程 | 记录日志并继续；采集设备死亡则带原因退出 |
+| 5 | `AplaySink` 用 SIGTERM | `aplay` 排空缓冲时忽略 SIGTERM → barge-in 后**还有约 2 s 语音在播** | 改用 SIGKILL，打断延迟 ≤1 个分块（100 ms） |
+| 6 | `AplaySink` 默认缓冲 | 每次播放尾部多排空约 0.5 s | `-B 200000`，1 s 音频耗时 1.77→1.36 s |
+| 7 | HTTP 后端每次新建 client | 每轮一次 TCP 握手 | 进程内复用一个 client，关闭时释放 |
+| 8 | `voiceprint.store_path` 默认 `None` | `enroll` 与 agent 可能读写**不同文件**，注册看起来无效 | 由 memory root 推导（`resolve_paths` / `assemble`） |
+| 9 | SenseVoice 输出含 `<\|zh\|>` 等标签 | 会被当作正文念出来 | 剥离标签（不用 FunASR 的 emoji 版后处理） |
+| 10 | `load_funasr` 不校验路径 | 路径写错会去 ModelScope 下载，报 404 而非本地错误 | 先校验目录存在 |
+| 11 | 源正常结束（EOF）走 `pipeline.close()`，而 `close()` 会**取消**在途 worker | 批处理/文件模式下最后一句回复被丢弃：用户说完，agent 的答复永远不出声 | 新增 `Pipeline.finish()`（join 不 cancel → drain → flush 尾段），`VoiceSession` 只在源**正常结束且未收到 stop** 时调用它；`request_stop()` 仍走 cancel 语义 |
+| 12 | `FileSource` 被硬编码 `loop=True` | 文件播完自动从头再来，第二轮在 agent 还在生成/播放时就打断自己（日志里 `[interrupted]`） | `build_source(loop=...)` + CLI `--no-loop`；同时把测试音频间隔从 7 s 提到 12 s（见 §9.5） |
+| 13 | worker 判定「不是对 agent 说的话」后直接 return，不产出 Turn | 状态机只认 Turn：pipeline 永远停在 GENERATING，下一句真实语音被误记为 `barge-in (turn in flight)`，实际没有 turn；文件源表现为 0 turn | `_has_completed()` 同时识别「worker 线程已结束但没有 Turn」；`tests/test_a7_pipeline.py` 增加回归用例 |
+
+### 9.3 新增：回声门（`vad.echo_guard`）
+
+单机扬声器+麦克风时，agent 会听见自己并**自打断**。实现为：播放期间丢弃采集帧（`echo_tail_ms` 覆盖混响尾巴）。两条前提必须同时成立才启用——**实时采集源**（`source.live`）且**发声 sink**（`sink.acoustic`）——否则文件源的真实语句会被误丢（这正是第一版的 bug）。
+
+这是半双工妥协，不是 AEC：戴上耳机可关掉以恢复真全双工。§8 的 P1「回声抑制」仍需 AEC + 播放参考信号才能真正解决。
+
+### 9.4 Roadmap 状态更新
+
+| 项 | 现状 |
+|----|------|
+| P0 AudioOutputController | **已修**（`AplaySink` 分块 + 可取消 + SIGKILL；`play(audio, cancel=...)` 进入 sink 协议） |
+| P0 任务 ID | 仍未做（每个 worker 独立 cancel event 已够当前场景） |
+| P1 回声抑制 | 部分（`echo_guard` 半双工缓解，非 AEC） |
+| P1 设备健康检查 | 部分（采集设备死亡会带原因退出；"无有效输入"仍未检测） |
+| P2 声纹模型与阈值校准 | **已做**（CAM++ + 实测阈值 0.35） |
+| P2 离线 TTS | **已做**（piper 本地合成 ~80 ms/句；`edge` 保留为联网备选） |
+| P2 后端共享契约测试 | **已做**（`tests/test_local_backends.py`，模型缺失时自动 skip） |
+
+### 9.5 操作要点：真实播放把"轮次间隔"变成硬约束
+
+测试音频（`scripts/build_test_audio.py`）的句间静音不是审美问题，而是**功能参数**。一"轮"从语音结束算起要走完 ASR→声纹→LLM→TTS→**实时播放**，本机实测约 9.7 s；而 VAD 的 barge-in 只要连续 `start_frames` 帧判定为语音就会立刻打断 worker 与播放。于是句间隔若短于该轮耗时，下一句会合法地打断上一句的播放——日志表现为 `[interrupted]`，听感表现为"agent 话说一半被掐掉"。
+
+实测：间隔 7 s 时正好压在边界上（第一句播放约 9.7 s 结束，第二句在约 10.1 s 开始），同一份音频不同次运行会时而完整时而打断；改成 12 s 后连续多次运行均 `interrupted=False`。所以：
+
+- 批量/回放场景用 `--no-loop`（文件只放一遍）+ 间隔 ≥12 s，才能保证每句都听完；
+- 24/7 实时场景不要指望"等它说完"，那是设计意图——用户随时可以打断（`--no-loop` 只影响文件源）。
+
+### 9.6 麦克风：一次误诊与修正（诊断方法论）
+
+部署当天我先得出"本机麦克风拿不到信号"的结论，并把它写进了文档和记忆。**这个结论是错的**，错在选错了观测信号。
+
+- 内置麦是 **DMIC Raw（`plhwg:1,6`）**，实际完全正常：连续 10 s 采集每秒 `rms` 170–334、峰值 925–1878，房间有音频时 `rms` 450–1300。`plughw:1,0` 是耳机口麦，没插耳机时 `rms≈0.00004`——我把这两条路径搞混了。
+- **误判来源**：我用 `arecord` 的 `/proc/<pid>/io` 里 `rchar` 不增长来推断"没有数据"。但 `plughw` 走 ALSA **mmap**，`arecord` 用 memcpy 从映射缓冲区取数，**不产生 `read()` 系统调用**，`rchar` 本来就不涨。正确的判据是 `/proc/asound/card1/pcm6c/sub0/status`：`state: RUNNING` + `hw_ptr` 前进 + `avail > 0`。
+- **真正的阻塞是独占**：DMIC 同时只能被一个进程打开（`dsnoop` 也无法打开已被独占的 slave）。它被另一个项目 `qwen25vl-agent` 的 `arecord` 长期独占，而那个父进程有守护逻辑，杀掉子进程约 20 s 后会重生一个继续占——表现为"设备或资源忙"，很容易被误读成设备故障。
+
+教训：**采集是否在流，要看内核 PCM 状态（hw_ptr/avail/state），不要看进程级 I/O 计数**；遇到"设备忙"先找持有者（`fuser -v /dev/snd/pcm*`），不要先怀疑硬件。

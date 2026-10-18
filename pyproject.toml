@@ -31,6 +31,10 @@ dsp = ["scipy>=1.9"]
 # A local `edge-tts`-style command TTS backend needs no Python package: the CLI
 # binary is invoked as a subprocess and its WAV output is read back.
 dev = ["pytest>=7.0"]
+# The locally-served backends: FunASR SenseVoice (ASR) + CAM++ (voiceprint),
+# edge-tts (speech), soundfile (decoding its MP3 stream).  These are the extras
+# the `funasr` / `edge` backends need; the runtime core never imports them.
+local = ["funasr>=1.1", "edge-tts>=6.1", "soundfile>=0.12"]
 
 [project.scripts]
 qwen-voice-agent = "qwen_voice_agent.cli:main"

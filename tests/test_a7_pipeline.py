@@ -57,20 +57,23 @@ def _make(cfg, tts, tmp_path):
 
 
 def _open_and_close(p, speech_frames=20, silence_frames=10):
+    turns = []
     for _ in range(5):
-        p.feed(_silence())          # establish the noise floor
+        turns += p.feed(_silence())  # establish the noise floor
     for _ in range(speech_frames):
-        p.feed(_tone())             # opens and sustains an utterance
+        turns += p.feed(_tone())     # opens and sustains an utterance
     for _ in range(silence_frames):
-        p.feed(_silence())          # closes it -> worker starts
+        # closes it -> worker starts; a fast worker may also finish here, so
+        # the turns it produced must not be dropped on the floor.
+        turns += p.feed(_silence())
+    return turns
 
 
 def test_pipeline_produces_a_turn(tmp_path):
     cfg = VoiceAgentConfig()
     cfg.vad.min_speech_ms = 200.0
     p = _make(cfg, FastTts(), tmp_path)
-    _open_and_close(p)
-    turns = []
+    turns = _open_and_close(p)
     for _ in range(200):
         turns += p.feed(_silence())
         if turns:
@@ -89,8 +92,7 @@ def test_pipeline_records_turn_in_memory(tmp_path):
     cfg = VoiceAgentConfig()
     cfg.vad.min_speech_ms = 200.0
     p = _make(cfg, FastTts(), tmp_path)
-    _open_and_close(p)
-    turns = []
+    turns = _open_and_close(p)
     for _ in range(200):
         turns += p.feed(_silence())
         if turns:
@@ -166,6 +168,34 @@ class HangingTts:
     def synthesize(self, text: str) -> AudioFrame:
         time.sleep(3.0)
         return AudioFrame(np.zeros(1600, dtype=np.float32), SR)
+
+
+def test_ignored_worker_returns_to_listening(tmp_path):
+    """Ambient speech must not leave the pipeline stuck in GENERATING.
+
+    A worker that decides an utterance is not addressed to the agent returns
+    without producing a Turn.  If the state machine only notices *turns*, that
+    finished worker is invisible: the pipeline stays GENERATING, and the next
+    real utterance is logged as a barge-in against a turn that no longer exists.
+    """
+    cfg = VoiceAgentConfig()
+    cfg.vad.min_speech_ms = 200.0
+    cfg.wake.enabled = True
+    cfg.wake.wake_word = "小丽同学"
+    p = _make(cfg, FastTts(), tmp_path)
+    _open_and_close(p)
+    assert p.state == PipelineState.GENERATING
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline and any(t.is_alive() for t in p._workers):
+        time.sleep(0.02)
+    assert not any(t.is_alive() for t in p._workers)
+
+    for _ in range(10):
+        p.feed(_silence())
+    assert p.state == PipelineState.LISTENING
+    assert p._ignored == 1
+    p.close()
 
 
 def test_worker_timeout_cancels_stuck_worker(tmp_path):

@@ -5,10 +5,12 @@ Two interchangeable backends sit behind one protocol:
 * :class:`EnergyVad` — a dependency-free adaptive-noise-floor detector.  Its
   threshold is *relative* to the recent noise floor rather than an absolute dB
   level, so one config survives both a quiet room and a noisy one.
-* :class:`SileroVad` — the Silero VAD v5 ONNX model through ``onnxruntime``.
-  Note its contract: the LSTM state is the pair ``h``/``c`` of shape
-  ``(2, 1, 64)``, not a single ``state`` tensor.  Feeding ``{"input", "state",
-  "sr"}`` fails.
+* :class:`SileroVad` — the Silero VAD ONNX model through ``onnxruntime``.  It
+  detects its own recurrent-state contract at load time, because two exports are
+  in circulation: the split ``h``/``c`` pair of shape ``(2, batch, 64)``, and the
+  combined ``state`` of shape ``(2, batch, 128)`` that ``snakers4/silero-vad``
+  currently ships.  Both are accepted; feeding one the other's tensors would
+  produce silent garbage.
 
 :class:`Segmenter` turns a frame stream into utterances using hysteresis: a turn
 opens after ``start_frames`` consecutive speech frames and closes after
@@ -82,11 +84,26 @@ class EnergyVad:
 
 
 class SileroVad:
-    """Silero VAD v5 via onnxruntime.
+    """Silero VAD via onnxruntime, accepting **both** recurrent-state contracts.
 
-    The model expects 512-sample windows at 16 kHz; shorter frames are buffered
+    The model consumes 512-sample windows at 16 kHz; shorter frames are buffered
     internally until a full window is available, at which point the recurrent
     state advances.  ``speech_prob`` returns the most recent window's probability.
+
+    Two ONNX exports of this model are in circulation and they are *not*
+    interchangeable:
+
+    * the **split** variant — inputs ``(input, sr, h, c)`` with ``h``/``c`` of
+      shape ``(2, batch, 64)`` and outputs ``hn``/``cn``;
+    * the **combined** variant — inputs ``(input, sr, state)`` with ``state`` of
+      shape ``(2, batch, 128)`` and output ``stateN``.  This is what
+      ``snakers4/silero-vad`` currently ships as ``silero_vad.onnx``.
+
+    Feeding one into the other silently produces garbage, so the contract is
+    detected from the session's own input names at load time and the right
+    recurrent tensors are carried.  The combined state is exactly the split
+    ``h``/``c`` concatenated along the last axis, which is why one code path can
+    serve both.
     """
 
     def __init__(self, cfg: VadConfig, model_path: Optional[str] = None) -> None:
@@ -106,19 +123,34 @@ class SileroVad:
         self._sess = ort.InferenceSession(path, sess_options=opts, providers=["CPUExecutionProvider"])
         self._in_names = [i.name for i in self._sess.get_inputs()]
         self._out_names = [o.name for o in self._sess.get_outputs()]
-        self._buf = np.zeros(0, dtype=np.float32)
-        self._h = np.zeros((2, 1, 64), dtype=np.float32)
-        self._c = np.zeros((2, 1, 64), dtype=np.float32)
-        self._last = 0.0
+
+        lows = [n.lower() for n in self._in_names]
+        self._split = any(n == "h" or n.startswith("h_") for n in lows)
+        if self._split:
+            self._hidden = 64  # (2, batch, 64) per half
+        else:
+            # Combined state: (2, batch, 128) = h (64) + c (64).
+            state = next((i for i in self._sess.get_inputs() if i.name.lower().startswith("state")), None)
+            self._hidden = int(state.shape[-1]) // 2 if state is not None and isinstance(state.shape[-1], int) else 64
+        self.reset()
 
     def reset(self) -> None:
         self._buf = np.zeros(0, dtype=np.float32)
-        self._h = np.zeros((2, 1, 64), dtype=np.float32)
-        self._c = np.zeros((2, 1, 64), dtype=np.float32)
+        self._h = np.zeros((2, 1, self._hidden), dtype=np.float32)
+        self._c = np.zeros((2, 1, self._hidden), dtype=np.float32)
+        self._context = np.zeros(0, dtype=np.float32)
         self._last = 0.0
 
     def _feed(self, window: np.ndarray, sample_rate: int) -> float:
-        inp = window.reshape(1, -1).astype(np.float32)
+        # The model is fed the *previous* chunk's tail as context, prepended to
+        # the new chunk: 64 + 512 = 576 samples at 16 kHz (32 + 256 at 8 kHz).
+        # Feeding the 512 new samples alone leaves the model reading them as
+        # context-plus-input, and it then reports near-zero speech probability on
+        # audio that is plainly speech — a silent failure, not an error.
+        ctx_size = 64 if sample_rate == 16000 else 32
+        if self._context.size != ctx_size:
+            self._context = np.zeros(ctx_size, dtype=np.float32)
+        inp = np.concatenate([self._context, window]).reshape(1, -1).astype(np.float32)
         sr = np.array([sample_rate], dtype=np.int64)
         feed = {}
         for name in self._in_names:
@@ -129,29 +161,36 @@ class SileroVad:
                 feed[name] = self._h
             elif low == "c" or low.startswith("c_"):
                 feed[name] = self._c
+            elif low.startswith("state"):
+                # Combined variant: the two halves are h and c.
+                feed[name] = np.concatenate([self._h, self._c], axis=-1)
             elif "input" in low or low in ("x", "waveform"):
                 feed[name] = inp
             else:
-                # Refuse rather than silently feed audio into an unknown slot
-                # (e.g. a v4 combined `state` tensor) — a shape mismatch here
-                # would surface far from the cause.
+                # Refuse rather than silently feed audio into an unknown slot — a
+                # shape mismatch here would surface far from the cause.
                 raise RuntimeError(
-                    f"unsupported Silero input {name!r}; this build expects the "
-                    "h/c recurrent-state variant with inputs (input, sr, h, c)"
+                    f"unsupported Silero input {name!r}; this build expects either "
+                    "the split (input, sr, h, c) or the combined (input, sr, state) variant"
                 )
         outs = self._sess.run(self._out_names, feed)
         by_name = dict(zip(self._out_names, outs))
         prob = 0.0
         for name, val in by_name.items():
             low = name.lower()
-            if low.startswith("output") or low == "prob" or low == "out":
+            if low.startswith("output") or low in ("prob", "out", "speech_probs"):
                 prob = float(np.asarray(val).reshape(-1)[0])
         for name, val in by_name.items():
             low = name.lower()
+            arr = np.asarray(val, dtype=np.float32)
             if low.startswith("hn"):
-                self._h = np.asarray(val, dtype=np.float32)
+                self._h = arr
             elif low.startswith("cn"):
-                self._c = np.asarray(val, dtype=np.float32)
+                self._c = arr
+            elif low.startswith("state"):
+                # Split the combined state back into h and c for the next window.
+                self._h, self._c = np.split(arr, 2, axis=-1)
+        self._context = window[-ctx_size:].astype(np.float32)
         return prob
 
     def speech_prob(self, frame: AudioFrame) -> float:

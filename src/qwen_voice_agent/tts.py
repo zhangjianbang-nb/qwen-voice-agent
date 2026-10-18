@@ -1,11 +1,14 @@
 """TTS backends.
 
-Four implementations behind one protocol:
+Five implementations behind one protocol:
 
+* :class:`EdgeTts` — Microsoft Edge's online neural voices through the
+  ``edge-tts`` package.  Synthesised in-process (no subprocess, no temp file) and
+  decoded to float32 with ``soundfile``; the best Chinese quality available here.
 * :class:`HttpTts` — OpenAI-compatible ``POST {base_url}/audio/speech``.
-* :class:`CommandTts` — run an external CLI (piper / edge-tts + ffmpeg / a local
-  Qwen TTS wrapper) that writes a WAV file, then read it back.  This wires a real
-  TTS without adding a Python dependency.
+* :class:`CommandTts` — run an external CLI (piper / a local Qwen TTS wrapper)
+  that writes a WAV file, then read it back.  This wires a real TTS without
+  adding a Python dependency.
 * :class:`MockTts` — a deterministic tone derived from the text, so pipeline and
   barge-in tests have real audio to play.
 * :class:`NullTts` — silence; the "headless, no speaker" default.
@@ -17,6 +20,7 @@ caller can discard.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import os
@@ -27,10 +31,20 @@ from typing import Optional, Protocol
 
 import numpy as np
 
-from .audio import AudioFrame, _decode_pcm, read_wav
+from .audio import AudioFrame, _decode_pcm, read_wav, resample
 from .config import TTSConfig
 
-__all__ = ["TtsBackend", "TtsError", "HttpTts", "CommandTts", "MockTts", "NullTts", "build_tts"]
+__all__ = [
+    "TtsBackend",
+    "TtsError",
+    "EdgeTts",
+    "PiperTts",
+    "HttpTts",
+    "CommandTts",
+    "MockTts",
+    "NullTts",
+    "build_tts",
+]
 
 
 class TtsError(RuntimeError):
@@ -79,17 +93,170 @@ def _parse_wav_bytes(data: bytes, fallback_sr: int) -> AudioFrame:
         return AudioFrame(arr, fallback_sr)
 
 
-class HttpTts:
-    """OpenAI-compatible ``POST {base_url}/audio/speech`` returning WAV bytes."""
+class EdgeTts:
+    """Speech from Microsoft Edge's online voices, synthesised in-process.
+
+    ``edge-tts`` streams MP3 over websockets; the stream is collected and decoded
+    with ``soundfile`` (libsndfile handles MP3), then resampled to the agent's
+    rate so the sink sees one consistent format.  Doing this in-process rather
+    than through ``CommandTts`` avoids a subprocess and a temp file per utterance.
+
+    The trade-off is honest: it needs the network at speak time.  A deployment
+    that must speak with the network down should use ``command`` with a local
+    engine, or a served Qwen TTS through ``http``.
+    """
 
     def __init__(self, cfg: TTSConfig) -> None:
         self.cfg = cfg
 
     def synthesize(self, text: str) -> AudioFrame:
+        text = (text or "").strip()
+        if not text:
+            return AudioFrame(np.zeros(0, dtype=np.float32), self.cfg.sample_rate)
         try:
-            import httpx  # type: ignore
+            import edge_tts  # type: ignore
         except Exception as exc:  # pragma: no cover
-            raise TtsError("HttpTts needs httpx installed") from exc
+            raise TtsError("EdgeTts needs the 'edge-tts' package") from exc
+
+        async def collect() -> bytes:
+            buf = bytearray()
+            async for chunk in edge_tts.Communicate(text, self.cfg.voice).stream():
+                if chunk.get("type") == "audio":
+                    buf += chunk["data"]
+            return bytes(buf)
+
+        try:
+            # The worker thread has no running loop, so asyncio.run is safe here.
+            mp3 = asyncio.run(asyncio.wait_for(collect(), timeout=self.cfg.timeout_s))
+        except asyncio.TimeoutError as exc:
+            raise TtsError(f"edge-tts timed out after {self.cfg.timeout_s}s") from exc
+        except Exception as exc:
+            raise TtsError(f"edge-tts synthesis failed: {exc}") from exc
+        if not mp3:
+            raise TtsError("edge-tts returned no audio")
+
+        try:
+            import soundfile as sf  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise TtsError("EdgeTts needs 'soundfile' to decode the MP3 stream") from exc
+        try:
+            data, sr = sf.read(io.BytesIO(mp3), dtype="float32")
+        except Exception as exc:
+            raise TtsError(f"could not decode edge-tts audio: {exc}") from exc
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != self.cfg.sample_rate:
+            data = resample(data, sr, self.cfg.sample_rate)
+        return AudioFrame(data, self.cfg.sample_rate)
+
+
+class PiperTts:
+    """Speech from a local ``piper`` voice (ONNX), synthesised in-process.
+
+    Piper runs a small VITS model through ``onnxruntime``: one short Chinese
+    sentence costs ~25-70 ms on this CPU, against ~1.5 s for edge-tts's network
+    round trip.  That difference *is* the perceived latency of the agent — the
+    user hears the reply roughly two seconds sooner — so piper is the default
+    when a voice is installed, and ``edge`` stays available for the best
+    naturalness.
+
+    The voice is loaded once and kept: ``PiperVoice.load`` costs ~1 s, which must
+    not land inside a turn.  Output is int16 PCM at the voice's own rate (22050
+    for ``zh_CN-huayan-medium``); the sink plays whatever rate the frame carries.
+    """
+
+    def __init__(self, cfg: TTSConfig) -> None:
+        self.cfg = cfg
+        self._voice: object = None
+
+    def _load(self):
+        if self._voice is not None:
+            return self._voice
+        try:
+            from piper import PiperVoice  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise TtsError("PiperTts needs the 'piper-tts' package") from exc
+        path = self.cfg.model_path
+        if not path:
+            raise TtsError("PiperTts needs tts.model_path (a piper voice .onnx)")
+        if not os.path.isfile(path):
+            # Without this the loader downloads the voice from the internet and
+            # fails with a network error, which reads like a piper bug.
+            raise TtsError(f"no such piper voice file: {path}")
+        config_path = self.cfg.model_config or f"{path}.json"
+        try:
+            self._voice = PiperVoice.load(path, config_path=config_path)
+        except Exception as exc:
+            raise TtsError(f"could not load piper voice {path}: {exc}") from exc
+        return self._voice
+
+    def warmup(self) -> None:
+        """Load the voice ONNX now; ~1 s, which must not land inside a turn."""
+        self._load()
+
+    def synthesize(self, text: str) -> AudioFrame:
+        text = (text or "").strip()
+        if not text:
+            return AudioFrame(np.zeros(0, dtype=np.float32), self.cfg.sample_rate)
+        voice = self._load()
+        syn_config = None
+        if self.cfg.length_scale is not None:
+            try:
+                from piper import SynthesisConfig  # type: ignore
+
+                syn_config = SynthesisConfig(length_scale=float(self.cfg.length_scale))
+            except Exception as exc:  # pragma: no cover
+                raise TtsError(f"could not build piper synthesis config: {exc}") from exc
+
+        pieces = []
+        try:
+            for chunk in voice.synthesize(text, syn_config):
+                raw = getattr(chunk, "audio_int16_bytes", None)
+                if raw:
+                    pieces.append(np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0)
+        except Exception as exc:
+            raise TtsError(f"piper synthesis failed: {exc}") from exc
+        if not pieces:
+            raise TtsError("piper returned no audio")
+
+        data = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        sr = int(voice.config.sample_rate)
+        if sr != self.cfg.sample_rate:
+            data = resample(data, sr, self.cfg.sample_rate)
+            sr = self.cfg.sample_rate
+        return AudioFrame(data, sr)
+
+    def close(self) -> None:
+        self._voice = None
+
+
+class HttpTts:
+    """OpenAI-compatible ``POST {base_url}/audio/speech`` returning WAV bytes."""
+
+    def __init__(self, cfg: TTSConfig) -> None:
+        self.cfg = cfg
+        self._client = None
+
+    def _http(self):
+        if self._client is None:
+            try:
+                import httpx  # type: ignore
+            except Exception as exc:  # pragma: no cover
+                raise TtsError("HttpTts needs httpx installed") from exc
+            self._client = httpx.Client(timeout=self.cfg.timeout_s)
+        return self._client
+
+    def close(self) -> None:
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+
+    def synthesize(self, text: str) -> AudioFrame:
+        client = self._http()
         url = self.cfg.base_url.rstrip("/") + "/audio/speech"
         headers = {}
         if self.cfg.api_key:
@@ -101,11 +268,10 @@ class HttpTts:
             "response_format": "wav",
         }
         try:
-            with httpx.Client(timeout=self.cfg.timeout_s) as client:
-                resp = client.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                data = resp.content
-        except httpx.HTTPError as exc:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.content
+        except Exception as exc:
             raise TtsError(f"TTS request to {url} failed: {exc}") from exc
         return _parse_wav_bytes(data, self.cfg.sample_rate)
 
@@ -201,6 +367,10 @@ class NullTts:
 
 def build_tts(cfg: TTSConfig) -> TtsBackend:
     """Instantiate the TTS backend named by ``cfg.backend``."""
+    if cfg.backend == "edge":
+        return EdgeTts(cfg)
+    if cfg.backend == "piper":
+        return PiperTts(cfg)
     if cfg.backend == "http":
         return HttpTts(cfg)
     if cfg.backend == "command":

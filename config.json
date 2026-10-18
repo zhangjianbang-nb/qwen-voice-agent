@@ -1,0 +1,87 @@
+{
+  "audio": {
+    "sample_rate": 16000,
+    "frame_ms": 20.0,
+    "ring_seconds": 30.0,
+    "input_gain": 1.0,
+    "input_device": "plughw:1,6",
+    "output_device": "default"
+  },
+  "vad": {
+    "backend": "silero",
+    "model_path": "/home/whu/models/silero-vad/silero_vad.onnx",
+    "speech_prob": 0.5,
+    "start_frames": 3,
+    "end_frames": 8,
+    "min_speech_ms": 250.0,
+    "max_speech_ms": 15000.0,
+    "pre_roll_ms": 300.0,
+    "echo_guard": true,
+    "echo_tail_ms": 400.0
+  },
+  "voiceprint": {
+    "enabled": true,
+    "backend": "funasr",
+    "model_path": null,
+    "threshold": 0.35,
+    "min_utterance_s": 0.6,
+    "store_path": "/home/whu/workspace/qwen-voice-agent/state/voiceprints.json"
+  },
+  "asr": {
+    "backend": "funasr",
+    "model_path": null,
+    "device": "cpu",
+    "language": "auto",
+    "use_itn": true,
+    "timeout_s": 30.0
+  },
+  "tts": {
+    "backend": "piper",
+    "voice": "zh_CN-huayan-medium",
+    "model_path": "/home/whu/models/piper/zh_CN-huayan-medium.onnx",
+    "sample_rate": 22050,
+    "length_scale": 1.0,
+    "timeout_s": 30.0
+  },
+  "llm": {
+    "backend": "http",
+    "base_url": "http://127.0.0.1:8082/v1",
+    "model": "Qwen3.5-4B",
+    "temperature": 0.6,
+    "max_tokens": 64,
+    "timeout_s": 60.0,
+    "system_prompt": "你是一个简洁、自然的语音助手，正在和 {person} 面对面说话。只回一句话，不超过二十个字，口语化，不要用 markdown、列表或表情符号。上下文里如果有相关信息就自然地用上；不知道就直说不知道，不要编造。\n\n{context}"
+  },
+  "memory": {
+    "root": "/home/whu/workspace/qwen-voice-agent/state",
+    "working_max_items": 64,
+    "working_ttl_s": 900.0,
+    "context_budget_chars": 400,
+    "extract_facts": true,
+    "seed_skills": true
+  },
+  "session": {
+    "max_seconds": null,
+    "idle_timeout_s": null,
+    "worker_timeout_s": 60.0,
+    "maintenance_interval_s": 60.0,
+    "max_turns": null,
+    "log_level": "INFO",
+    "realtime": true
+  },
+  "wake": {
+    "enabled": true,
+    "wake_word": "小丽同学",
+    "aliases": [
+      "小莉同学",
+      "小丽同",
+      "小莉同"
+    ],
+    "follow_up_s": 8.0,
+    "ack": "在呢，你说。",
+    "require_enrolled": true,
+    "fuzzy_ratio": 0.75,
+    "barge_in_frames": 15
+  },
+  "persons": []
+}

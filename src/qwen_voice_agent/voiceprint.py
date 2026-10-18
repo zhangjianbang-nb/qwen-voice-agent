@@ -1,15 +1,20 @@
 """Speaker (voiceprint) embedding and identification.
 
-Three embedding backends behind one protocol:
+Four embedding backends behind one protocol:
 
+* :class:`FunAsrEmbedding` — the **local** FunASR CAM++ speaker-verification
+  model (192-dim).  This is the backend this deployment runs, and it is a real
+  speaker model: on the checkpoint's own examples the same speaker scores 0.69
+  while a different speaker scores ~0.00, so a stranger *is* rejected.  It is
+  also cheap (~0.04 s per utterance) and needs no network.
 * :class:`MelEmbedding` — a dependency-free log-mel statistics pool.  This is a
   *deterministic placeholder*, not a real speaker model: it discriminates audio
   by its spectral envelope, which is enough to make the enrolment/identification
   plumbing testable without shipping a checkpoint, but it is **not** robust to a
-  speaker saying different words.  Production deployments should set
-  ``voiceprint.backend`` to ``onnx`` and point ``model_path`` at an ECAPA /
-  WeSpeaker / 3D-Speaker checkpoint.
-* :class:`OnnxEmbedding` — any ONNX speaker-embedding model via onnxruntime.
+  speaker saying different words.  Kept as the default so the package still works
+  with no checkpoint on disk.
+* :class:`OnnxEmbedding` — any ONNX speaker-embedding model via onnxruntime
+  (ECAPA / WeSpeaker / 3D-Speaker).
 * :class:`ResemblyzerEmbedding` — the ``resemblyzer`` package, if installed.
 
 :class:`VoiceprintStore` keeps enrolled speakers in a JSON file and identifies a
@@ -32,6 +37,7 @@ from .config import VoiceprintConfig
 
 __all__ = [
     "EmbeddingBackend",
+    "FunAsrEmbedding",
     "MelEmbedding",
     "OnnxEmbedding",
     "ResemblyzerEmbedding",
@@ -165,6 +171,43 @@ class ResemblyzerEmbedding:
         return _l2norm(vec)
 
 
+class FunAsrEmbedding:
+    """Speaker embedding from FunASR's CAM++ speaker-verification checkpoint.
+
+    The checkpoint (``iic/speech_campplus_sv_zh-cn_16k-common``) is a trained
+    speaker model, so unlike :class:`MelEmbedding` it separates people rather than
+    audio: the same speaker's two clips score 0.69, a stranger's ~0.00.  The
+    acceptance threshold therefore has to be calibrated for *this* backend
+    (~0.35), not inherited from the mel placeholder's 0.75.
+
+    The model is loaded once through :mod:`qwen_voice_agent.local_models` and
+    reused, so the load cost is not paid per utterance.
+    """
+
+    def __init__(self, model_path: Optional[str] = None, device: str = "cpu") -> None:
+        from .local_models import campplus_dir, load_funasr
+
+        path = model_path or campplus_dir()
+        if not path:
+            raise ValueError(
+                "voiceprint.backend='funasr' needs a local CAM++ checkpoint: set "
+                "voiceprint.model_path, or download "
+                "'iic/speech_campplus_sv_zh-cn_16k-common' into the ModelScope cache"
+            )
+        self.model_path = path
+        self._model = load_funasr(path, device=device)
+        self.dim = 192  # CAM++ zh-cn 16k common
+
+    def embed(self, frame: AudioFrame) -> np.ndarray:
+        x = np.asarray(frame.samples, dtype=np.float32).reshape(-1)
+        if frame.sample_rate != _EMBED_SR:
+            x = resample(x, frame.sample_rate, _EMBED_SR)
+        out = self._model.generate(input=x, fs=_EMBED_SR, cache={}, batch_size_s=60)
+        vec = np.asarray(out[0]["spk_embedding"]).reshape(-1).astype(np.float32)
+        self.dim = int(vec.size)
+        return _l2norm(vec)
+
+
 def _l2norm(v: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(v))
     return (v / n).astype(np.float32) if n > 1e-12 else v.astype(np.float32)
@@ -172,6 +215,8 @@ def _l2norm(v: np.ndarray) -> np.ndarray:
 
 def build_embedder(cfg: VoiceprintConfig) -> EmbeddingBackend:
     """Instantiate the embedding backend named by ``cfg.backend``."""
+    if cfg.backend == "funasr":
+        return FunAsrEmbedding(cfg.model_path)
     if cfg.backend == "onnx":
         if not cfg.model_path:
             raise ValueError("voiceprint.backend='onnx' requires model_path")
