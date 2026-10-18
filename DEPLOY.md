@@ -8,7 +8,7 @@
 
 ## 1. 一句话现状
 
-四个推理环节全部换成真实模型并跑通端到端：**Silero VAD → FunASR SenseVoice ASR（本地）→ CAM++ 声纹（本地）→ 8082 的 Qwen3.5-4B → piper TTS（本地）→ aplay 播放**。验收测试 87 通过 / 0 失败（2 项硬件测试默认跳过，显式开启后也通过）。**未跑通的一环是本机麦克风**（见 §7）。
+四个推理环节全部换成真实模型并跑通端到端：**Silero VAD → FunASR SenseVoice ASR（本地）→ CAM++ 声纹（本地）→ 8082 的 Qwen3.5-4B → piper TTS（本地）→ aplay 播放**。验收测试 89 通过 / 0 失败（2 项硬件测试默认跳过，显式开启后也通过）。**未跑通的一环是本机麦克风**（见 §7）。
 
 ```bash
 cd /home/whu/workspace/qwen-voice-agent
@@ -68,6 +68,14 @@ Silero 模型取自 `git clone https://github.com/snakers4/silero-vad`（`raw.gi
 
 `echo_guard=true`：单机扬声器+麦克风时，agent 会听见自己 → 自打断。开启后播放期间丢弃采集帧；代价是播放时无法真打断。戴耳机可设 `false` 换回真全双工（见 §7）。
 
+**声纹门（主人 vs 电视）**：`wake.require_enrolled=true` 让唤醒/响应必须过 CAM++；`vad.barge_in_verify=true` 让打断也必须过声纹——电视里的人声不会唤醒助手，也不会在生成期间把回复掐断。两条路径都 fail closed（声纹出错 = 不是主人）。注册主人声纹：
+
+```bash
+bash scripts/enroll_owner.sh     # 录 15 s，确认转写后注册，并重启 agent
+```
+
+注册前 `state/voiceprints.json` 只有示例音色 Ada/Bo，agent 对任何声音都不响应（安全默认值）。
+
 ## 6. 实测数字
 
 **单轮延迟（暖机后）**
@@ -94,7 +102,7 @@ mel 占位后端做不到拒识陌生人，CAM++ 可以——这是本次替换�
 
 **真实播放链路已核实**：`--sink aplay` 运行期间，两个 `aplay` 子进程各从 stdin 读走 166 KB / 131 KB PCM（≈5.2 s / 4.1 s），`/proc/<pid>/io` 的 `rchar` 随时间单调增长（实时消费而非一次灌入）；其 fd 是两条 PipeWire socket 而非 `/dev/snd/*`，因为 `-D default` 走 PipeWire 插件；`wpctl status` 显示默认 sink 为 `sof-hda-dsp Speaker + Headphones [vol: 1.26]`，未静音。
 
-**测试**：`pytest` 87 passed / 2 skipped；`QVA_TEST_AUDIO=1` 时那 2 项也通过。
+**测试**：`pytest` 89 passed / 2 skipped；`QVA_TEST_AUDIO=1` 时那 2 项也通过。
 
 **端到端 demo**（`--source file --sink aplay --no-loop`，句间隔 12 s）：两轮均 `interrupted=False`，第 1 轮正确引用第 0 轮的回复（working memory 生效），两次完整播放，exit=0。注意句间隔是功能参数而非审美——见 `docs/DESIGN.md` §9.5：本机一轮（ASR→LLM→TTS→实时播放）约 9.7 s，间隔 7 s 正好压在 barge-in 边界上，同一份音频不同次运行会时而打断时而完整。
 

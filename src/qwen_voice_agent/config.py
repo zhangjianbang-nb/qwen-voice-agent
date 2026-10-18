@@ -84,6 +84,12 @@ class VadConfig:
     pre_roll_ms: float = 300.0
     echo_guard: bool = False  # drop capture while the agent speaks (see above)
     echo_tail_ms: float = 400.0  # keep dropping this long after playback ends
+    # When the owner's voiceprint is enrolled, verify a barge-in candidate before
+    # cancelling: a television in the room also trips the VAD, and VAD alone
+    # cannot tell it from the owner.  Verification waits for
+    # `voiceprint.min_utterance_s` of audio, so the interruption lands ~0.3 s
+    # later than the VAD-only path; that delay buys "the TV does not cut me off".
+    barge_in_verify: bool = True
 
 
 @dataclass

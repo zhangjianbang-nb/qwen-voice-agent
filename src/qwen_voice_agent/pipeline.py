@@ -198,6 +198,8 @@ class Pipeline:
         self._state = PipelineState.LISTENING
         self._barge_run = 0
         self._barge_frames: List[Tuple[AudioFrame, float]] = []
+        self._barge_audio: List[AudioFrame] = []
+        self._barge_cooldown_until = 0.0
         self._workers: List[threading.Thread] = []
         self._cancel = threading.Event()      # the *current* worker's event
         self._worker_started = 0.0
@@ -229,6 +231,14 @@ class Pipeline:
         # Barge-in is VAD-only, so with a screen in the room it needs a higher
         # bar; without it every line of dialogue cuts the agent off mid-sentence.
         self._barge_in_frames = int(cfg.wake.barge_in_frames or cfg.vad.start_frames)
+        # Barge-in is VAD-only by default, which is wrong in a room with a
+        # television: the TV trips the VAD and cuts the agent off.  When the
+        # owner is enrolled and required, verify the speaker before cancelling.
+        self._barge_verify = (
+            bool(cfg.vad.barge_in_verify)
+            and voiceprints is not None
+            and bool(cfg.wake.require_enrolled)
+        )
         if cfg.wake.require_enrolled and voiceprints is None:
             log.warning(
                 "wake.require_enrolled is set but no voiceprint backend is "
@@ -254,24 +264,30 @@ class Pipeline:
         prob = self.vad.speech_prob(frame)
 
         if self._state == PipelineState.GENERATING:
-            if prob >= self.cfg.vad.speech_prob:
+            if time.monotonic() < self._barge_cooldown_until:
+                # Just rejected a non-owner barge-in; do not pay for another
+                # embedding every 20 ms while the television keeps talking.
+                self._reset_barge()
+            elif prob >= self.cfg.vad.speech_prob:
                 self._barge_run += 1
                 self._barge_frames.append((frame, prob))
-                if self._barge_run >= self._barge_in_frames:
-                    # Barge-in: cancel the worker, then replay every frame that
-                    # confirmed the interruption into the segmenter so the
-                    # opening syllables of the user's new utterance are not lost.
-                    log.info("barge-in: cancelling generation (turn in flight)")
-                    self._cancel.set()
-                    self._state = PipelineState.LISTENING
-                    self._barge_run = 0
-                    self.segmenter.reset()
-                    pending, self._barge_frames = self._barge_frames, []
-                    for f, p in pending:
-                        self._maybe_start(f, p)
+                if self._barge_verify:
+                    # VAD cannot tell the owner from a television.  Collect
+                    # enough audio for a speaker embedding, then decide.
+                    self._barge_audio.append(frame)
+                    if self._barge_audio_s() >= self.cfg.voiceprint.min_utterance_s:
+                        if self._barge_is_owner():
+                            self._trigger_barge_in()
+                        else:
+                            log.debug("ignored barge-in candidate: not the enrolled owner")
+                            self._reset_barge()
+                            self._barge_cooldown_until = time.monotonic() + max(
+                                1.0, self.cfg.voiceprint.min_utterance_s
+                            )
+                elif self._barge_run >= self._barge_in_frames:
+                    self._trigger_barge_in()
             else:
-                self._barge_run = 0
-                self._barge_frames = []
+                self._reset_barge()
             self._check_worker_timeout()
             if self._has_completed():
                 self._state = PipelineState.LISTENING
@@ -336,6 +352,41 @@ class Pipeline:
                 pass
 
     # ---- state helpers -------------------------------------------------
+    def _barge_audio_s(self) -> float:
+        return sum(f.duration_s for f in self._barge_audio)
+
+    def _barge_is_owner(self) -> bool:
+        if self.voiceprints is None or not self._barge_audio:
+            return False
+        sr = self._barge_audio[0].sample_rate
+        samples = np.concatenate([f.samples for f in self._barge_audio])
+        try:
+            return bool(self.voiceprints.identify(AudioFrame(samples, sr)).accepted)
+        except Exception as exc:
+            # Fail closed: an unreadable voiceprint must not hand the agent to
+            # whoever is on the television.
+            log.warning("barge-in speaker check failed: %s", exc)
+            return False
+
+    def _reset_barge(self) -> None:
+        self._barge_run = 0
+        self._barge_frames = []
+        self._barge_audio = []
+
+    def _trigger_barge_in(self) -> None:
+        # Cancel the worker, then replay every frame that confirmed the
+        # interruption into the segmenter so the opening syllables of the
+        # owner's new utterance are not lost.
+        log.info("barge-in: cancelling generation (turn in flight)")
+        self._cancel.set()
+        self._state = PipelineState.LISTENING
+        pending, self._barge_frames = self._barge_frames, []
+        self._barge_run = 0
+        self._barge_audio = []
+        self.segmenter.reset()
+        for f, p in pending:
+            self._maybe_start(f, p)
+
     def _maybe_start(self, frame: AudioFrame, prob: float) -> None:
         utt = self.segmenter.push(frame, prob)
         if utt is not None:

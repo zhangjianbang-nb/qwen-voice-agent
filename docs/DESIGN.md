@@ -239,12 +239,23 @@ class VoiceSession:
 | 11 | 源正常结束（EOF）走 `pipeline.close()`，而 `close()` 会**取消**在途 worker | 批处理/文件模式下最后一句回复被丢弃：用户说完，agent 的答复永远不出声 | 新增 `Pipeline.finish()`（join 不 cancel → drain → flush 尾段），`VoiceSession` 只在源**正常结束且未收到 stop** 时调用它；`request_stop()` 仍走 cancel 语义 |
 | 12 | `FileSource` 被硬编码 `loop=True` | 文件播完自动从头再来，第二轮在 agent 还在生成/播放时就打断自己（日志里 `[interrupted]`） | `build_source(loop=...)` + CLI `--no-loop`；同时把测试音频间隔从 7 s 提到 12 s（见 §9.5） |
 | 13 | worker 判定「不是对 agent 说的话」后直接 return，不产出 Turn | 状态机只认 Turn：pipeline 永远停在 GENERATING，下一句真实语音被误记为 `barge-in (turn in flight)`，实际没有 turn；文件源表现为 0 turn | `_has_completed()` 同时识别「worker 线程已结束但没有 Turn」；`tests/test_a7_pipeline.py` 增加回归用例 |
+| 14 | barge-in 只按 VAD 判定 | 电视/视频里的人声会在生成期间把 agent 的回复掐断（用户实测 87 轮里 80 轮被打断） | `vad.barge_in_verify`：先做 CAM++ 声纹验证，只有注册用户能打断；非用户冷却 1 s（见 §9.3.1） |
 
 ### 9.3 新增：回声门（`vad.echo_guard`）
 
 单机扬声器+麦克风时，agent 会听见自己并**自打断**。实现为：播放期间丢弃采集帧（`echo_tail_ms` 覆盖混响尾巴）。两条前提必须同时成立才启用——**实时采集源**（`source.live`）且**发声 sink**（`sink.acoustic`）——否则文件源的真实语句会被误丢（这正是第一版的 bug）。
 
 这是半双工妥协，不是 AEC：戴上耳机可关掉以恢复真全双工。§8 的 P1「回声抑制」仍需 AEC + 播放参考信号才能真正解决。
+
+### 9.3.1 声纹门：谁能唤醒、谁能打断
+
+一台机器放在客厅里，麦克风会同时收到主人和电视。两条路径都必须过声纹，否则电视里的人声会冒充主人：
+
+- **唤醒/响应**（`wake.require_enrolled=true`）：`Pipeline._gate` 在 ASR 之后用 CAM++ `identify` 判定；非注册用户直接 `ignored`，不进入 LLM/TTS。
+- **打断**（`vad.barge_in_verify=true`）：原实现只看 VAD，电视对话会在生成期间触发 `barge-in` 把回复掐断。现在先累积 `voiceprint.min_utterance_s`（默认 0.6 s）音频做 `identify`，只有注册用户才 `cancel` worker；非用户则丢弃候选并冷却 1 s，避免对着持续播放的电视每 20 ms 跑一次嵌入。代价是真打断比 VAD-only 晚约 0.3 s。
+- 两条路径都 **fail closed**：声纹后端报错时按“不是主人”处理，不会把 agent 交给电视。
+
+主人声纹用 `scripts/enroll_owner.sh` 现场录 15 s 注册（脚本会先停 agent 释放独占的 DMIC，注册后重启）。注册前 `voiceprints.json` 里只有示例音色 Ada/Bo，agent 对任何声音都不响应——这是有意的安全默认值。
 
 ### 9.4 Roadmap 状态更新
 

@@ -43,7 +43,7 @@ def _silence():
     return AudioFrame(np.zeros(FRAME, dtype=np.float32), SR)
 
 
-def _make(cfg, tts, tmp_path):
+def _make(cfg, tts, tmp_path, voiceprints=None):
     return Pipeline(
         cfg,
         vad=EnergyVad(cfg.vad),
@@ -53,6 +53,7 @@ def _make(cfg, tts, tmp_path):
         llm=MockLlm(),
         memory=MemoryManager(cfg.memory, root=str(tmp_path)),
         sink=NullSink(),
+        voiceprints=voiceprints,
     )
 
 
@@ -159,6 +160,62 @@ def test_pipeline_run_over_synthetic_source(tmp_path):
             break
     assert len(turns) >= 2
     assert [t.index for t in turns] == list(range(len(turns)))
+    p.close()
+
+
+class FakeVoiceprints:
+    """Stands in for VoiceprintStore: every utterance is (or is not) the owner."""
+
+    def __init__(self, accepted: bool) -> None:
+        self.accepted = accepted
+        self.calls = 0
+
+    def identify(self, frame):
+        from qwen_voice_agent.voiceprint import IdentificationResult
+
+        self.calls += 1
+        return IdentificationResult(
+            person_id="p1" if self.accepted else None,
+            name="Ada" if self.accepted else None,
+            score=0.9 if self.accepted else 0.05,
+            accepted=self.accepted,
+            ranking=[("p1", 0.9 if self.accepted else 0.05)],
+        )
+
+
+def test_a_television_does_not_barge_in(tmp_path):
+    """VAD alone would let any voice in the room cut the agent off."""
+    cfg = VoiceAgentConfig()
+    cfg.vad.min_speech_ms = 200.0
+    cfg.wake.require_enrolled = True
+    vp = FakeVoiceprints(accepted=False)
+    p = _make(cfg, HangingTts(), tmp_path, voiceprints=vp)
+    _open_and_close(p)
+    assert p.state == PipelineState.GENERATING
+
+    # 40 frames = 0.8 s, past voiceprint.min_utterance_s (0.6 s).
+    for _ in range(40):
+        p.feed(_tone())
+    assert vp.calls >= 1, "the barge-in candidate was never checked against the voiceprint"
+    assert p.state == PipelineState.GENERATING, "a non-owner voice cut the agent off"
+    assert not p._cancel.is_set()
+    p.close()
+
+
+def test_the_owner_can_still_barge_in(tmp_path):
+    """Verification must not make the agent deaf to the person it serves."""
+    cfg = VoiceAgentConfig()
+    cfg.vad.min_speech_ms = 200.0
+    cfg.wake.require_enrolled = True
+    vp = FakeVoiceprints(accepted=True)
+    p = _make(cfg, HangingTts(), tmp_path, voiceprints=vp)
+    _open_and_close(p)
+    assert p.state == PipelineState.GENERATING
+
+    for _ in range(40):
+        p.feed(_tone())
+    assert p.state == PipelineState.LISTENING
+    assert p._cancel.is_set()
     p.close()
 
 

@@ -17,7 +17,8 @@
     "max_speech_ms": 15000.0,
     "pre_roll_ms": 300.0,
     "echo_guard": true,
-    "echo_tail_ms": 400.0
+    "echo_tail_ms": 400.0,
+    "barge_in_verify": true
   },
   "voiceprint": {
     "enabled": true,
