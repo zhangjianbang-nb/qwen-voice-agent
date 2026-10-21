@@ -28,10 +28,18 @@ class Episode:
 class EpisodicMemory:
     """JSONL-backed append-only event log."""
 
-    def __init__(self, path: str, cache_limit: int = 1000) -> None:
+    def __init__(
+        self,
+        path: str,
+        cache_limit: int = 1000,
+        max_bytes: int = 16_000_000,
+        tail_bytes: int = 3_000_000,
+    ) -> None:
         self.path = path
         self._cache: List[Episode] = []
         self._cache_limit = cache_limit
+        self._max_bytes = max(0, int(max_bytes))
+        self._tail_bytes = max(0, int(tail_bytes))
         if path and os.path.exists(path):
             self._load()
 
@@ -59,16 +67,46 @@ class EpisodicMemory:
         return len(self._cache)
 
     # ---- persistence ---------------------------------------------------
+    def _ensure_newline(self) -> None:
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                last = fh.read(1)
+        except OSError:
+            return
+        if last != b"\n":
+            with open(self.path, "ab") as fh:
+                fh.write(b"\n")
+
+    def _rotate_if_needed(self) -> None:
+        if not self._max_bytes or not os.path.exists(self.path):
+            return
+        try:
+            if os.path.getsize(self.path) < self._max_bytes:
+                return
+            os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+
     def _write(self, ep: Episode) -> None:
         if not self.path:
             return
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self._ensure_newline()
+        self._rotate_if_needed()
         rec = {"kind": ep.kind, "data": ep.data, "ts": ep.ts, "person": ep.person}
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def _load(self) -> None:
+        start = 0
+        size = os.path.getsize(self.path)
+        if self._tail_bytes and size > self._tail_bytes:
+            start = size - self._tail_bytes
         with open(self.path, "r", encoding="utf-8") as fh:
+            if start:
+                fh.seek(start)
+                fh.readline()
             for line in fh:
                 line = line.strip()
                 if not line:

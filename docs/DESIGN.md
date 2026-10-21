@@ -16,7 +16,7 @@
 | 约束 | 实测值 | 设计对策 |
 |------|--------|----------|
 | 麦克风 | `arecord -l` 设备列表为空 → **本机无录音设备** | 音频源抽象为 `AudioSource`；提供 file / synthetic / null 三种，mic 为可选 extra |
-| GPU torch | 已装 `torch 2.14.1+cpu`，`cuda.is_available()=False` | 核心不 import torch；本地推理走 HTTP backend，torch 只在 `transformers` extra 里惰性加载 |
+| GPU | **2026-10-19 驱动恢复**：`nvidia-smi` 正常，RTX 5060 8 GB；但 `torch` 仍是 `2.14.1+cpu` | 核心不 import torch；LLM 走 llama.cpp 的 CUDA 后端（`NGLAYERS=99`），不依赖 torch；本地 transformers 后端仍不可用 |
 | ASR/TTS/声纹模型 | 盘上无专用模型 | 每级推理藏于 backend protocol 后：`http` / `transformers` / `scripted` / `mock` |
 | 音频 IO 库 | `sounddevice/soundfile/librosa` 均未装 | 只用 numpy 读写 WAV（自解析 RIFF 头）；重采样 numpy 线性 + scipy polyphase 可选 |
 | 验收素材 | omni-bot 有 `silero_vad.onnx` + 两个真实语音 WAV | VAD 用 Silero ONNX（onnxruntime 已装）；验收用真实 WAV，不用合成音 |
@@ -33,7 +33,9 @@ qwen_voice_agent/
 ├── voiceprint.py      # mel/onnx 嵌入后端 + 声纹库（注册/识别/排名）
 ├── asr.py             # ASR backend protocol: http/transformers/scripted/mock
 ├── tts.py             # TTS backend protocol: http/command/mock/null
-├── llm.py             # LLM backend protocol: http/local/mock
+├── llm.py             # LLM backend protocol: http/local/mock + tool_calls 解析
+├── tools.py           # 工具注册表 + 15 个内置工具（时间/记忆/文件/浏览器/桌面/提醒）
+├── scheduler.py       # 定时提醒：时间解析、JSON 持久化、claim/complete
 ├── memory/
 │   ├── voice.py       # 声音记忆：谁在何时说了什么（含嵌入）
 │   ├── working.py     # 工作记忆：TTL 环形，当前会话近因
@@ -50,8 +52,11 @@ qwen_voice_agent/
 依赖方向（单向，无环）：
 
 ```
-cli → session → pipeline → {sources, vad, voiceprint, asr, tts, llm, memory.manager}
+cli → session → pipeline → {sources, vad, voiceprint, asr, tts, llm, tools, scheduler, memory.manager}
                                                         memory.manager → memory.{voice,working,semantic,episodic,procedural}
+                                                        tools → memory.manager
+                                                        tools → scheduler
+                                                        pipeline → scheduler（主动播报）
 ```
 
 ## 4. 关键接口
@@ -98,10 +103,44 @@ class TtsBackend(Protocol):
 
 class LlmBackend(Protocol):
     def chat(self, messages: list[dict]) -> str: ...
-# HttpLlm(/v1/chat/completions) | LocalLlm(transformers) | MockLlm
+# HttpLlm(/v1/chat/completions) | LocalLlm(transformers) | MockLlm | ScriptedLlm(测试)
+
+@dataclass
+class LlmReply:
+    content: str
+    tool_calls: List[ToolCall]      # 空 = 普通回答；非空 = 要求执行工具
+
+def chat_with_tools(llm, messages, tools) -> LlmReply
+# 有 chat_with_tools 就调用；没有则退回 chat()（mock/local 不需要实现工具）
+
+# tools.py
+@dataclass(frozen=True)
+class Tool:
+    name: str; description: str; parameters: dict; func: Callable
+    context_kwarg: Optional[str]   # 由运行时注入、模型不可伪造的键（如 person_id）
+
+class ToolRegistry:
+    max_rounds: int
+    def schemas(self) -> list[dict]          # OpenAI tools[] 条目
+    def execute(self, call: ToolCall, context: dict | None) -> ToolResult
+    # 未知工具 / 坏 JSON / 参数错 / 工具内部异常 → ToolResult(ok=False)，不抛到 pipeline
+
+# scheduler.py
+@dataclass
+class Schedule:
+    id: str; text: str; due_ts: float; repeat: str   # once/daily/weekdays/weekly
+    claimed_until: float; next_attempt_ts: float     # 进程内，不持久化
+
+class Scheduler:
+    def add(text, due_ts, repeat) -> Schedule
+    def claim_due(now) -> Schedule | None    # 先认领再播报，避免同一帧重复触发
+    def complete(id) / release(id, retry_after_s)
+    def list() / cancel(id)
+
+def parse_when(text, now=None) -> float      # “10分钟后”“明天早上8点”“每天8点”“周一9点”
 ```
 
-`system_prompt` 是带 `{context}` `{person}` 占位的模板，每轮由 memory manager 渲染 —— 人格是配置，不是改源码。
+`system_prompt` 是带 `{context}` `{person}` 占位的模板，每轮由 memory manager 渲染 —— 人格是配置，不是改源码。工具规则必须放在人格描述**之前**，否则 4B 模型会忽略“先调工具”。
 
 ### 4.3 五类记忆
 
@@ -117,7 +156,10 @@ class LlmBackend(Protocol):
 class MemoryManager:
     def context_block(self, person: str, query: str) -> str   # 字符预算内拼上下文
     def observe(self, turn: Turn) -> None                     # 一轮结束后写入各 store
+    def observe_proactive(self, turn: Turn) -> None            # 主动提醒：只写工作/情景记忆
     def remember_fact(self, key, value) / recall_fact(key)
+    # recall_fact(person_id=None) 先查 unknown，再跨人物取最近一条；
+    # 已知 person_id 时严格按人物隔离。
 ```
 
 `context_budget_chars` 是**字符**预算不是 token —— 记忆层不许依赖 tokenizer；保守取值，因为上下文块每轮前插，无界会让延迟随对话长度增长。
@@ -155,7 +197,7 @@ class VoiceSession:
     # - SIGTERM/SIGINT → 优雅退出（停 TTS/sink、flush 记忆、关 source）
 ```
 
-## 5. 验收标准 A1–A8（可编程断言）
+## 5. 验收标准 A1–A10（可编程断言）
 
 | # | 断言 | 判据 |
 |---|------|------|
@@ -167,15 +209,19 @@ class VoiceSession:
 | **A6** | 五类记忆 | 五个 store 各自读写 round-trip；`MemoryManager.observe` 后 `context_block` 含该轮信息且长度 ≤ `context_budget_chars`；语义事实可存可查 |
 | **A7** | 全双工 + barge-in | 用合成脚本音频驱动 pipeline：TTS 播放中注入"用户说话"帧 → 生成 worker 被 cancel、TTS 停止、状态回 LISTENING；产出 Turn 序列正确 |
 | **A8** | 24h 循环 | `VoiceSession` 在 `max_seconds`/`max_turns` 到期后优雅退出；worker 卡死触发 `worker_timeout_s` 取消；SIGTERM 触发优雅停机并落盘记忆；维护循环按 `maintenance_interval_s` 触发 |
+| **A9** | 工具调用环 | 模型返回 `tool_calls` 时工具被执行、结果以 `role: "tool"` 回填、二次生成产出最终回复；`max_rounds` 到期后强制无工具回答；未知工具/坏 JSON/参数错/工具异常都变成 `ok=False` 的结果而非崩溃 |
+| **A10** | 动作工具 + 定时提醒 | 文件读写被限制在 `workspace_root`（`..`/symlink/绝对路径逃逸均拒绝，超限拒绝）；浏览器拒绝非 http(s)；应用只走白名单；桌面工具未开 `control_enabled` 时构建即报错；到期的提醒被主动播报、定时任务到点走 LLM+工具环、一次性完成后删除、重复推进到下一个未来时刻、中断/失败后按 `retry_s` 重试 |
 
 每条断言写成 `tests/` 下的 pytest 用例，`pytest -q` 全绿即验收通过。
 
 ## 6. 风险与开放问题
 
-1. **无麦克风** → 真实实时监听无法在本机跑。验收用 file source + 真实 WAV 覆盖 A3/A4/A7；mic 路径只做代码级审查 + doctor 探活。
-2. **无 GPU torch** → 本地 transformers ASR/TTS 不可用；`http` backend 是生产路径，测试用 mock/scripted。
+1. **麦克风可用但有独占约束** → 2026-10-18 已确认 DMIC `plughw:1,6` 正常；同一时刻只能被一个进程打开，另一项目占用时表现为“设备忙”（见 DEPLOY §7.1）。验收用 file source + 真实 WAV 覆盖 A3/A4/A7。
+2. **GPU 已可用但 torch 仍是 CPU 版** → 本地 transformers ASR/TTS 不可用；LLM 通过 llama.cpp CUDA 后端全量 offload，`http` backend 仍是生产路径，测试用 mock/scripted。
 3. **无 ASR/TTS 模型** → 需定位或下载 Qwen ASR / Qwen TTS（候选：`Qwen3-ASR`、`CosyVoice2`/`Qwen3-TTS`）与声纹模型（`3D-Speaker`/`WeSpeaker`/ECAPA）。**本机可先不下载**，架构用 mock 打通；下载为后续增强项。
 4. **声纹后端与阈值** → 默认 `voiceprint.backend="mel"` 是**确定性占位**（log-mel 统计池化），只按频谱包络区分音频，**不保证拒识陌生人**、对同一人不同话不鲁棒；生产须换 `onnx`（ECAPA / WeSpeaker / 3D-Speaker）并按真实注册音频标定 `threshold`（默认 0.75 只是起点）。
+5. **Wayland 桌面控制** → `xdotool` 只对 X11/XWayland 客户端可靠；原生 Wayland 客户端（Chrome 的 ozone/Wayland 后端、GNOME 应用）会忽略合成输入。原生注入需 `ydotool`（`/dev/uinput` 权限）或 RemoteDesktop portal，本机未配置。
+6. **截图** → Wayland 下 `scrot` 只拍到黑色 X root；`gnome-screenshot`/`grim` 未安装，Shell 的 Screenshot D-Bus 对非 shell 调用 `AccessDenied`。工具会报错，不返回黑图。
 
 ## 7. 外部评审（2026-10-17）
 
@@ -263,6 +309,10 @@ class VoiceSession:
 |----|------|
 | P0 AudioOutputController | **已修**（`AplaySink` 分块 + 可取消 + SIGKILL；`play(audio, cancel=...)` 进入 sink 协议） |
 | P0 任务 ID | 仍未做（每个 worker 独立 cancel event 已够当前场景） |
+| 工具调用（agent 能力） | **已做**（`tools.py` + pipeline `_chat_with_tools`；15 个工具：时间/记忆、文件、浏览器/应用、桌面 opt-in、提醒/定时任务；A9/A10） |
+| 定时任务 / 主动提醒 | **已做**（`scheduler.py` + pipeline `poll_proactive`；一次性/每天/工作日/每周；JSON 持久化 + claim；A10） |
+| Wayland 原生输入 | 未做（需 `ydotool` 或 RemoteDesktop portal） |
+| Wayland 截图后端 | 未做（`gnome-screenshot`/`grim` 未安装） |
 | P1 回声抑制 | 部分（`echo_guard` 半双工缓解，非 AEC） |
 | P1 设备健康检查 | 部分（采集设备死亡会带原因退出；"无有效输入"仍未检测） |
 | P2 声纹模型与阈值校准 | **已做**（CAM++ + 实测阈值 0.35） |
@@ -287,3 +337,71 @@ class VoiceSession:
 - **真正的阻塞是独占**：DMIC 同时只能被一个进程打开（`dsnoop` 也无法打开已被独占的 slave）。它被另一个项目 `qwen25vl-agent` 的 `arecord` 长期独占，而那个父进程有守护逻辑，杀掉子进程约 20 s 后会重生一个继续占——表现为"设备或资源忙"，很容易被误读成设备故障。
 
 教训：**采集是否在流，要看内核 PCM 状态（hw_ptr/avail/state），不要看进程级 I/O 计数**；遇到"设备忙"先找持有者（`fuser -v /dev/snd/pcm*`），不要先怀疑硬件。
+
+### 9.7 工具调用：从“会说话”到“会做事”（2026-10-19）
+
+**动机**：模型没有当前时间的概念。实测问“现在几点了？”，4B 直接编了“现在三点”，而当时是上午十点。记忆同理：用户说“记住我叫小明”，模型回“好的，记住了”，但什么都没存，下一轮问名字时只能道歉。工具调用是唯一能让回答落到真实状态上的机制。
+
+**接口**：`tools.py` 定义 `Tool(name, description, parameters, func)` 与 `ToolRegistry`；`llm.py` 增加 `LlmReply(content, tool_calls)`、`HttpLlm.chat_with_tools`、以及兼容层 `chat_with_tools(llm, messages, tools)`（没有实现工具的后端自动退回 `chat`）。pipeline 的 `_worker_body` 在 `tools` 非空时调用 `_chat_with_tools`：
+
+```
+LLM(tools) → tool_calls?
+  ├─ 否 → content 直接 TTS
+  └─ 是 → 执行每个 call → 追加 assistant(tool_calls) + tool(result)
+           → LLM(tools) 再问一次（最多 max_rounds 轮）
+           → 达到上限后 LLM(no tools) 强制产出文字
+```
+
+**四个设计决定**：
+
+1. **失败是数据，不是崩溃**。未知工具、坏 JSON、参数不匹配、工具内部异常，全部变成 `ToolResult(ok=False, content="error: ...")` 回填给模型。模型可以道歉或换参数重试；24/7 进程不因一次工具调用死掉。
+2. **有界轮次 + 强制收尾**。`max_rounds`（默认 3）防止模型无限调工具；最后一轮不带 `tools`，因为语音助手不能以沉默结束——空回复回退到“好的。”。
+3. **执行期间静默门**。`_task_busy=true` 时 `_gate` 丢弃环境人声，避免电视/旁人开启竞争 turn；外部 `task_gate` 仍可放行纠正指令。
+4. **没有 shell 工具**。能执行任意命令的语音 agent 就是一个带麦克风的 RCE 端点。工具集后来扩展到 15 个，但每个动作工具都有明确边界：文件只读写在 `workspace_root` 内（`realpath` 先解 symlink 再判包含）、浏览器只收 http/https、应用只从 `allowed_apps` 启动且 argv 不经 shell、桌面输入必须 `control_enabled=true`。模型无法通过工具名/参数注入命令。
+
+**提示词是功能参数**（真实数据上踩到的坑）：把工具规则写在人格描述之后时，模型 5/5 都选择直接回答“记住了”，不调工具；把“必须调用、只说记住了等于没记住、闲聊不调工具”放在**最前面**后，三种意图 4/4 命中，闲聊也不再误调。换模型/换语言必须重验，不能假设 `tool_choice=auto` 足够。
+
+**实测**（`state/tools/dialog.wav`，GPU 服务）：三轮分别 `get_current_time` / `remember_fact` / `recall_fact`，`tools=1`、`interrupted=False`，最终回复正确，语义记忆落下 `name=小明`。含工具的单轮 LLM 耗时 698–955 ms（两轮生成），无工具 217–297 ms。
+
+### 9.8 GPU 恢复后的延迟重测（2026-10-19）
+
+昨天 GPU 因驱动/内核不匹配不可用，LLM 在 CPU 上 823–2603 ms，是端到端的主要瓶颈。今天 `nvidia-smi` 正常（RTX 5060 8 GB，驱动 595.99.02），llama.cpp 带 CUDA 后端，用 `THREADS=8 NGLAYERS=99` 重启 8082 后：
+
+| 场景 | 旧（CPU） | 新（GPU 99 层） |
+|------|-----------|------------------|
+| LLM 单轮 | 823–2603 ms | **217–297 ms** |
+| LLM + 工具环 | — | **698–955 ms** |
+| 全链路（无工具） | 约 2.6–2.8 s | **约 0.4–0.5 s** |
+
+显存占用 3.2 GB，`torch` 仍是 CPU 版（不影响 llama.cpp）。结论：**不需要流式 TTS**——LLM 已经不是瓶颈，piper 的 24–150 ms 才是下一档；继续优化应优先看 barge-in 声纹验证的 0.3 s 等待和 piper 音质，而不是把 LLM 输出切成句子。
+
+### 9.9 动作工具与定时提醒：能力必须带边界（2026-10-19）
+
+**动机**：用户要求 agent 能写文件、打开浏览器/应用、操控电脑，并能定时提醒。这些能力与“查时间”不是一个风险等级：一个能执行任意动作的语音 agent，如果边界没写清楚，就是一个带麦克风的自动化端点。
+
+**五组工具与边界**：
+
+| 组 | 工具 | 边界 |
+|----|------|------|
+| 时间/记忆 | `get_current_time` / `remember_fact` / `recall_fact` | `person_id` 由运行时通过 `Tool.context_kwarg` 注入，模型传的同名参数被覆盖，不能读写别人事实 |
+| 文件 | `write_file` / `read_file` / `list_files` | `workspace_root` 沙箱；`realpath` 先解析 symlink 再判包含；读写均受 `max_file_bytes` 限制；写入用 temp+`os.replace`，崩溃不产生半截文件 |
+| 浏览器/应用 | `open_browser` / `open_app` | URL 只接受 http/https（自动补 https），`query` 走百度；应用值必须是单个可执行名/路径，`Popen(argv)` 不经 shell |
+| 桌面（opt-in） | `type_text` / `press_key` / `screenshot` | `control_enabled=true` 才构建；按键名白名单正则；截图按会话类型选后端，Wayland 下拒绝 scrot 黑图 |
+| 提醒/任务 | `set_reminder` / `schedule_task` / `list_reminders` / `cancel_reminder` | 时间由 Python 解析（不信任模型算时间）；`Scheduler` JSON 原子写；claim 防重复，崩溃后 claim 过期重试；`kind=task` 在到点后走 LLM+工具环再播报 |
+
+**主动播报为什么放在 pipeline 而不是线程**：提醒必须能被打断。复用 generation worker 的 cancel 事件与 `sink.play(cancel=...)`，用户插话时提醒立即停止；播报前检查 `state==LISTENING`、`segmenter.active==False`、上一帧 VAD 为静音、无 `_task_busy`，避免在用户说话时抢话。提醒本身也产生一个 `Turn(proactive=True)`，经 `observe_proactive` 写入工作/情景记忆，但不进声音记忆（没有用户语音）。
+
+**固定提醒 vs 定时任务**：`set_reminder` 只播报固定文字；`schedule_task` 在到点后把 `prompt` 送进同一套 `_chat_with_tools`（LLM+工具环），再播报结果。两者共用 `Scheduler`、claim 和重试逻辑，只差 `kind`。描述里必须写明“到点做事用 schedule_task、固定提醒用 set_reminder”，否则 4B 会把“每天播报天气”误选成 set_reminder（实测一次误选，加负例后 6/6 正确）。
+
+**时间解析的取舍**：4B 模型不会可靠地把“明天早上八点”换算成时间戳，所以工具接口是自然语言 `when`，Python 负责解析相对时间、中文数字、星期、时段和 ISO。解析失败返回可读错误，模型可重试；解析成功的结果带“今天/明天”标签，避免模型把当天 12:16 说成“明天”。
+
+**实测**（2026-10-19）：
+
+- 真实配置下 `write_file`/`read_file`/`list_files` 往返一致；`../`、工作区外绝对路径、指向外部的 symlink 均被拒。
+- `open_browser` 打开 `https://example.com` 成功；`screenshot` 在本机明确报“无可用后端”，没有返回黑图。
+- Xephyr 的 X11 会话中，`type_text` + `press_key` 对 Tk 输入框真实生效（输出 `hello via tool`）；GNOME/Wayland 原生窗口不保证。
+- 预置到期提醒后跑真实 pipeline（piper TTS + file sink）：日志 `schedule due`，CLI `[0] [提醒 ...] -> '提醒你：喝水'`，生成 71 KB WAV，一次性提醒随后删除。
+- 预置 `kind=task` 的到期任务“现在几点了？”跑真实 pipeline：日志 `schedule due (task)`，两次 LLM 请求（`get_current_time` 工具环 + 最终回答），CLI `[0] [任务 ...] -> '现在是2026年10月19日星期一中午12点49分。'`，生成 235 KB WAV，任务随后删除。
+- 4B 模型对新 schema 的工具选择 6/6 命中：查时间、写文件、设提醒、设定时任务、开浏览器搜索、列提醒；描述里明确“到点做事用 schedule_task、固定提醒用 set_reminder”后，模型不再把“每天播报天气”误选成 set_reminder。
+
+- 实时麦克风全链路（临时取消扬声器静音，音量 1.0，播放放大后的测试音频）：原始 DMIC rms≈0.0055，Silero 在 `input_gain=1` 时 max_prob≈0.10、`input_gain=8` 时≈0.97；测试配置 gain=8 下产出 1 轮 `快介绍一下。` → `我是你的语音助手，随时帮你处理各种任务。`，写出 156 KB WAV。默认 gain=1 对扬声器回放偏小，真人说话需按现场电平校准。

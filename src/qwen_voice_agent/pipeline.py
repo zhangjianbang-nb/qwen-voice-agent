@@ -38,19 +38,22 @@ utterances; the ``null``/``file`` sinks used in tests return immediately.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import numpy as np
 
 from .audio import AudioFrame
 from .config import VoiceAgentConfig, WakeConfig
-from .llm import LlmBackend, render_system_prompt
+from .llm import LlmBackend, chat_with_tools, render_system_prompt
 from .memory import MemoryManager
+from .scheduler import Schedule, Scheduler
 from .sources import AudioSink, AudioSource
+from .tools import ToolRegistry
 from .vad import Segmenter, Utterance, VadBackend
 
 __all__ = ["Turn", "Pipeline", "PipelineState", "strip_wake_word", "contains_wake_word"]
@@ -60,6 +63,18 @@ log = logging.getLogger("qwen_voice_agent.pipeline")
 # Punctuation and whitespace that ASR sprinkles through a sentence; the wake word
 # has to be found across it ("小丽同学，" vs "小丽同学").
 _WAKE_NOISE = set("，。！？、；：,.!?;: 　\n\r\t“”\"'()（）[]【】-—…")
+
+
+def _arguments_json(arguments) -> str:
+    """Normalise a tool call's arguments to the JSON string the API expects.
+
+    llama-server returns a string; a test double may hand back a dict.  Both
+    must be replayed verbatim in the assistant message, or the follow-up request
+    fails to match the tool result to its call.
+    """
+    if isinstance(arguments, str):
+        return arguments or "{}"
+    return json.dumps(arguments, ensure_ascii=False)
 
 
 def _normalise(text: str) -> tuple:
@@ -162,6 +177,14 @@ class Turn:
     ended_s: float = 0.0
     interrupted: bool = False
     audio: Optional[AudioFrame] = None
+    # What the model actually did before speaking: [{"name", "arguments",
+    # "result", "ok"}].  Empty when the turn needed no tool.
+    tool_calls: List[dict] = field(default_factory=list)
+    # A proactive turn has no user utterance: the agent spoke a due reminder or
+    # ran a scheduled task.  `proactive_kind` is "reminder" or "task".
+    proactive: bool = False
+    proactive_kind: str = "reminder"
+    schedule_id: Optional[str] = None
 
     @property
     def duration_s(self) -> float:
@@ -184,6 +207,8 @@ class Pipeline:
         sink: AudioSink,
         voiceprints=None,
         live_capture: bool = False,
+        tools: Optional[ToolRegistry] = None,
+        scheduler: Optional[Scheduler] = None,
     ) -> None:
         self.cfg = cfg
         self.vad = vad
@@ -194,6 +219,17 @@ class Pipeline:
         self.memory = memory
         self.sink = sink
         self.voiceprints = voiceprints
+        # None means "no tool loop": the worker calls the LLM exactly once, the
+        # pre-tool behaviour.  A registry turns on the tool_calls -> execute ->
+        # second-round path in `_chat_with_tools`.
+        self.tools = tools
+        # The same Scheduler the reminder tools write to.  `None` disables
+        # proactive announcements; the pipeline then only answers utterances.
+        self.scheduler = scheduler
+        # Previous frame's speech probability: a due reminder waits while the
+        # user is mid-sentence instead of talking over them.
+        self._last_prob = 0.0
+        self._next_proactive_poll = 0.0
 
         self._state = PipelineState.LISTENING
         self._barge_run = 0
@@ -213,9 +249,12 @@ class Pipeline:
         self._ignored = 0
         self._last_ignore_reason: Optional[str] = None
         # Set while a task is running; the pipeline then ignores ambient speech
-        # instead of starting new turns (see `task_gate`).
-        self.task_gate: Optional[callable] = None
-        self.on_progress: Optional[callable] = None
+        # instead of starting new turns.  `task_gate` is the external policy (it
+        # may let a correction through); `_task_busy` is set by the worker while
+        # it is executing tool calls.
+        self.task_gate: Optional[Callable[[str], bool]] = None
+        self.on_progress: Optional[Callable[[str, str], None]] = None
+        self._task_busy = False
         # While the agent is speaking through the same machine's speakers, the
         # microphone hears it.  The guard is only meaningful when *both* halves of
         # that acoustic loop exist: a live microphone that can hear the agent, and
@@ -252,6 +291,9 @@ class Pipeline:
 
     def feed(self, frame: AudioFrame) -> List[Turn]:
         """Feed one frame; return any turns completed as a result (usually none)."""
+        # A reminder is an *input* as well as a turn: check it before processing
+        # this frame so a due schedule starts speaking at the next idle moment.
+        self.poll_proactive()
         if self._echo_guard and time.monotonic() < self._play_until:
             # The agent is talking and the microphone is hearing it.  Drop the
             # frame — but keep the worker-timeout check and the drain, so a stuck
@@ -262,6 +304,7 @@ class Pipeline:
             return self._drain()
 
         prob = self.vad.speech_prob(frame)
+        self._last_prob = prob
 
         if self._state == PipelineState.GENERATING:
             if time.monotonic() < self._barge_cooldown_until:
@@ -342,7 +385,7 @@ class Pipeline:
             self._drain()
         except Exception:
             pass
-        for obj in (self.sink, self.asr, self.tts, self.llm):
+        for obj in (self.sink, self.asr, self.tts, self.llm, self.scheduler):
             closer = getattr(obj, "close", None)
             if closer is None:
                 continue
@@ -403,6 +446,116 @@ class Pipeline:
             )
             self._cancel.set()
 
+    # ---- proactive reminders -------------------------------------------
+    def poll_proactive(self, now: Optional[float] = None) -> None:
+        """Start speaking a due reminder if the agent is otherwise idle.
+
+        Conditions are deliberately conservative: no generation in flight, no
+        open utterance (the user is mid-sentence), no task busy, and the previous
+        VAD frame was silence.  A reminder is an utterance the user did not ask
+        for, so it must never cut across one they did.
+        """
+        if self.scheduler is None or self._state != PipelineState.LISTENING:
+            return
+        wall = time.time() if now is None else now
+        if wall < self._next_proactive_poll:
+            return
+        self._next_proactive_poll = wall + max(0.05, float(self.cfg.scheduler.poll_interval_s))
+        if self._task_busy or getattr(self.segmenter, "active", False):
+            return
+        if self._last_prob >= self.cfg.vad.speech_prob:
+            return
+        if any(t.is_alive() for t in self._workers):
+            return
+        if self._echo_guard and time.monotonic() < self._play_until:
+            return
+        item = self.scheduler.claim_due(wall)
+        if item is not None:
+            self._start_proactive(item)
+
+    def _start_proactive(self, item: Schedule) -> None:
+        self._workers = [t for t in self._workers if t.is_alive()]
+        cancel = threading.Event()
+        self._cancel = cancel
+        self._worker_started = time.monotonic()
+        log.info("schedule due: %s (%s) %r", item.id, item.kind, item.text)
+        t = threading.Thread(
+            target=self._proactive_body,
+            args=(item, cancel),
+            name="qva-reminder",
+            daemon=True,
+        )
+        self._workers.append(t)
+        self._state = PipelineState.GENERATING
+        t.start()
+
+    def _proactive_body(self, item: Schedule, cancel: threading.Event) -> None:
+        tool_calls_made: List[dict] = []
+        try:
+            if item.kind == "task":
+                # A scheduled task runs the prompt through the same LLM/tool loop
+                # as a user turn, then speaks the answer.  It is not prefixed with
+                # "提醒你：" because the result is the message.
+                context = self.memory.context_block("there", item.text)
+                system_prompt = render_system_prompt(self.cfg.llm, "there", context)
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": item.text},
+                ]
+                if self.tools is not None and self.tools.enabled:
+                    text, tool_calls_made = self._chat_with_tools(
+                        messages,
+                        cancel,
+                        context={"person_id": None, "person_name": "there"},
+                    )
+                else:
+                    text = str(self.llm.chat(messages)).strip()
+                if cancel.is_set():
+                    self.scheduler.release(item.id)
+                    return
+                text = text.strip() or "定时任务已完成。"
+            else:
+                text = self.cfg.scheduler.speak_prefix + item.text
+            audio = self.tts.synthesize(text)
+            if cancel.is_set():
+                self.scheduler.release(item.id)
+                return
+            if self._echo_guard:
+                self._play_until = (
+                    time.monotonic()
+                    + audio.duration_s
+                    + self.cfg.vad.echo_tail_ms / 1000.0
+                )
+            self.sink.play(audio, cancel=cancel)
+            interrupted = cancel.is_set()
+            if interrupted:
+                # The owner talked over the reminder; retry after `retry_s`
+                # rather than restarting it the instant they stop.
+                self.scheduler.release(item.id)
+            else:
+                self.scheduler.complete(item.id)
+            turn = Turn(
+                index=self._next_index(),
+                person_id=None,
+                person_name="there",
+                user_text="",
+                reply=text,
+                started_s=time.monotonic(),
+                ended_s=time.monotonic(),
+                interrupted=interrupted,
+                audio=audio,
+                tool_calls=tool_calls_made,
+                proactive=True,
+                proactive_kind=item.kind,
+                schedule_id=item.id,
+            )
+            with self._lock:
+                self._completed.append(turn)
+        except Exception as exc:
+            # A failed reminder must not take the 24/7 loop down; it is retried.
+            log.warning("reminder %s failed: %s", item.id, exc)
+            self.scheduler.release(item.id)
+
     # ---- worker --------------------------------------------------------
     def _start_worker(self, utt: Utterance) -> None:
         # Reap finished threads so the list does not grow unboundedly.
@@ -447,8 +600,13 @@ class Pipeline:
         wake = self.cfg.wake
 
         # A task in flight owns the conversation; ambient speech is not a new
-        # command.  `task_gate` decides what (if anything) still gets through.
-        if self.task_gate is not None and not self.task_gate(text):
+        # command.  `task_gate` is the external policy and may let a correction
+        # through; when no policy is installed, a running tool loop still wins.
+        if self._task_busy:
+            if self.task_gate is None or not self.task_gate(text):
+                self._ignore("busy with a task", text)
+                return None
+        elif self.task_gate is not None and not self.task_gate(text):
             self._ignore("busy with a task", text)
             return None
 
@@ -495,19 +653,29 @@ class Pipeline:
 
             reply = ""
             audio = None
+            tool_calls_made: List[dict] = []
             interrupted = cancel.is_set()
             if not interrupted and action == "ack":
                 # The wake word stood alone: answer it without troubling the LLM.
                 reply = self.cfg.wake.ack
             elif not interrupted:
-                context = self.memory.context_block(person_name, transcript)
+                context = self.memory.context_block(
+                    person_name, transcript, person_id=person_id
+                )
                 system_prompt = render_system_prompt(self.cfg.llm, person_name, context)
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": transcript},
                 ]
                 _t = time.monotonic()
-                reply = self.llm.chat(messages)
+                if self.tools is not None and self.tools.enabled:
+                    reply, tool_calls_made = self._chat_with_tools(
+                        messages,
+                        cancel,
+                        context={"person_id": person_id, "person_name": person_name},
+                    )
+                else:
+                    reply = self.llm.chat(messages)
                 t_llm = time.monotonic() - _t
                 interrupted = cancel.is_set()
             if not interrupted:
@@ -530,11 +698,12 @@ class Pipeline:
                 interrupted = cancel.is_set()
 
             log.debug(
-                "worker done: interrupted=%s asr=%r reply_chars=%d "
+                "worker done: interrupted=%s asr=%r reply_chars=%d tools=%d "
                 "stage_ms(asr=%.0f vp=%.0f llm=%.0f tts=%.0f)",
                 interrupted,
                 transcript[:40],
                 len(reply),
+                len(tool_calls_made),
                 t_asr * 1000,
                 t_vp * 1000,
                 t_llm * 1000,
@@ -552,12 +721,96 @@ class Pipeline:
                 ended_s=utt.end_s,
                 interrupted=interrupted,
                 audio=audio,
+                tool_calls=tool_calls_made,
             )
             with self._lock:
                 self._completed.append(turn)
         except BaseException as exc:  # surfaced to the main thread on drain
             with self._lock:
                 self._errors.append(exc)
+
+    def _chat_with_tools(
+        self,
+        messages: List[dict],
+        cancel: threading.Event,
+        context: Optional[dict] = None,
+    ) -> Tuple[str, List[dict]]:
+        """Ask → execute → feed results back → ask again, bounded by ``max_rounds``.
+
+        The second round is the whole point: a tool result is not spoken to the
+        user, it is *context* the model turns into a sentence.  Every request and
+        result is appended in the OpenAI message shape, so the server can match
+        ``tool_call_id`` to its result; a malformed history would make the model
+        repeat the call or answer from thin air.
+
+        If the model keeps calling tools, the final request is sent without the
+        ``tools`` array, which forces prose instead of another call.  Silence is
+        not an acceptable outcome for a voice agent, so an empty answer falls
+        back to a short acknowledgement.
+        """
+        assert self.tools is not None
+        schemas = self.tools.schemas()
+        msgs = list(messages)
+        executed: List[dict] = []
+        content = ""
+        for _round in range(self.tools.max_rounds):
+            if cancel.is_set():
+                return content, executed
+            reply = chat_with_tools(self.llm, msgs, schemas)
+            content = reply.content
+            if not reply.has_tool_calls:
+                return content, executed
+
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": reply.content,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": _arguments_json(call.arguments),
+                            },
+                        }
+                        for call in reply.tool_calls
+                    ],
+                }
+            )
+            # While tools run, ambient speech must not start a competing turn;
+            # `_gate` checks this flag and ignores new utterances.
+            self._task_busy = True
+            try:
+                for call in reply.tool_calls:
+                    if cancel.is_set():
+                        return content, executed
+                    result = self.tools.execute(call, context=context)
+                    executed.append(
+                        {
+                            "name": result.name,
+                            "arguments": call.arguments,
+                            "result": result.content,
+                            "ok": result.ok,
+                        }
+                    )
+                    log.debug("tool %s(%s) -> %r", result.name, call.arguments, result.content[:80])
+                    if self.on_progress is not None:
+                        try:
+                            self.on_progress(result.name, result.content)
+                        except Exception:
+                            log.warning("on_progress callback failed", exc_info=True)
+                    msgs.append(
+                        {"role": "tool", "tool_call_id": call.id, "content": result.content}
+                    )
+            finally:
+                self._task_busy = False
+
+        if cancel.is_set():
+            return content, executed
+        # Max rounds reached: no tools this time, so the model has to answer.
+        final = str(self.llm.chat(msgs)).strip()
+        return (final or content or "好的。"), executed
 
     def _next_index(self) -> int:
         with self._lock:
@@ -586,7 +839,10 @@ class Pipeline:
         if errors:
             raise errors[0]
         for turn in turns:
-            self.memory.observe(turn)
+            if getattr(turn, "proactive", False):
+                self.memory.observe_proactive(turn)
+            else:
+                self.memory.observe(turn)
         return turns
 
     def _join_workers(self, timeout: Optional[float] = None) -> None:

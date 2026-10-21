@@ -35,10 +35,18 @@ class VoiceUtterance:
 class VoiceMemory:
     """Append-only log of identified utterances."""
 
-    def __init__(self, path: str, cache_limit: int = 500) -> None:
+    def __init__(
+        self,
+        path: str,
+        cache_limit: int = 500,
+        max_bytes: int = 8_000_000,
+        tail_bytes: int = 2_000_000,
+    ) -> None:
         self.path = path
         self._cache: List[VoiceUtterance] = []
         self._cache_limit = cache_limit
+        self._max_bytes = max(0, int(max_bytes))
+        self._tail_bytes = max(0, int(tail_bytes))
         if path and os.path.exists(path):
             self._load()
 
@@ -80,6 +88,8 @@ class VoiceMemory:
         if not self.path:
             return
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self._ensure_newline()
+        self._rotate_if_needed()
         rec = {
             "person_id": utt.person_id,
             "name": utt.name,
@@ -94,8 +104,49 @@ class VoiceMemory:
         with open(self.path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+    def _ensure_newline(self) -> None:
+        """Repair a partial tail from a crash before appending.
+
+        A killed process can leave the last JSON object without its newline; the
+        next append would then merge two records into one unparseable line.
+        """
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(-1, os.SEEK_END)
+                last = fh.read(1)
+        except OSError:
+            return
+        if last != b"\n":
+            with open(self.path, "ab") as fh:
+                fh.write(b"\n")
+
+    def _rotate_if_needed(self) -> None:
+        """Keep one backup and start a fresh log once the file is large.
+
+        Append-only is right for durability but wrong for a 24/7 process: without
+        a bound the file grows forever and startup has to read all of it.  One
+        rotated file is enough to keep the previous era greppable.
+        """
+        if not self._max_bytes or not os.path.exists(self.path):
+            return
+        try:
+            if os.path.getsize(self.path) < self._max_bytes:
+                return
+            os.replace(self.path, self.path + ".1")
+        except OSError:
+            pass
+
     def _load(self) -> None:
+        start = 0
+        size = os.path.getsize(self.path)
+        if self._tail_bytes and size > self._tail_bytes:
+            # Read only the tail: a long-running log must not cost O(file) RAM
+            # or startup time.  Drop the first partial line after seeking.
+            start = size - self._tail_bytes
         with open(self.path, "r", encoding="utf-8") as fh:
+            if start:
+                fh.seek(start)
+                fh.readline()
             for line in fh:
                 line = line.strip()
                 if not line:

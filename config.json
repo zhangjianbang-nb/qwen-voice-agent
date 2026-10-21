@@ -49,9 +49,9 @@
     "base_url": "http://127.0.0.1:8082/v1",
     "model": "Qwen3.5-4B",
     "temperature": 0.6,
-    "max_tokens": 64,
+    "max_tokens": 512,
     "timeout_s": 60.0,
-    "system_prompt": "你是一个简洁、自然的语音助手，正在和 {person} 面对面说话。只回一句话，不超过二十个字，口语化，不要用 markdown、列表或表情符号。上下文里如果有相关信息就自然地用上；不知道就直说不知道，不要编造。\n\n{context}"
+    "system_prompt": "规则：涉及当前时间/日期，或用户要求记住/查询长期事实、写/读/列文件、打开浏览器/应用、在电脑上输入/按键/截图、设置/查看/取消定时提醒或定时任务时，必须先调用对应工具，拿到结果后再用一句话回答。用户要求到点执行任务（如播报天气、总结、查询）时用 schedule_task；只要求到点提醒一句话时用 set_reminder。只说“记住了”而不调用 remember_fact、只说“设好了”而不调用 set_reminder，都等于没做。工具报错时如实告诉用户，不要假装成功。闲聊时不要调用工具。\n\n你是一个简洁、自然的语音助手，正在和 {person} 面对面说话。只回一句话，不超过二十个字，口语化，不要用 markdown、列表或表情符号。上下文里如果有相关信息就自然地用上；不知道就直说不知道，不要编造。\n\n{context}"
   },
   "memory": {
     "root": "/home/whu/workspace/qwen-voice-agent/state",
@@ -83,6 +83,45 @@
     "require_enrolled": true,
     "fuzzy_ratio": 0.75,
     "barge_in_frames": 15
+  },
+  "scheduler": {
+    "enabled": true,
+    "store_path": "/home/whu/workspace/qwen-voice-agent/state/schedules.json",
+    "poll_interval_s": 0.5,
+    "max_schedules": 100,
+    "speak_prefix": "提醒你：",
+    "retry_s": 60.0
+  },
+  "tools": {
+    "enabled": true,
+    "max_rounds": 3,
+    "builtins": [
+      "time",
+      "remember_fact",
+      "recall_fact",
+      "write_file",
+      "read_file",
+      "list_files",
+      "open_browser",
+      "open_app",
+      "set_reminder",
+      "schedule_task",
+      "list_reminders",
+      "cancel_reminder",
+      "type_text",
+      "press_key",
+      "screenshot"
+    ],
+    "control_enabled": true,
+    "workspace_root": "/home/whu/workspace/qwen-voice-agent/agent_files",
+    "max_file_bytes": 65536,
+    "browser_command": "xdg-open",
+    "allowed_apps": {
+      "firefox": "firefox",
+      "chrome": "google-chrome",
+      "files": "nautilus",
+      "terminal": "gnome-terminal"
+    }
   },
   "persons": []
 }

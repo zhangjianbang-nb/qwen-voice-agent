@@ -37,7 +37,9 @@ from .asr import build_asr
 from .llm import build_llm
 from .memory import MemoryManager
 from .pipeline import Pipeline, Turn
+from .scheduler import Scheduler
 from .sources import AudioSink, AudioSource, build_sink, build_source
+from .tools import build_tools
 from .tts import build_tts
 from .vad import Segmenter, build_vad
 from .voiceprint import VoiceprintStore
@@ -235,6 +237,10 @@ def assemble(
     base = os.path.abspath(memory_root or cfg.memory.root)
     if cfg.voiceprint.store_path is None:
         cfg.voiceprint.store_path = os.path.join(base, "voiceprints.json")
+    # A test or a bounded run with --memory-root must not read/write the
+    # production reminder file; keep the scheduler beside the memory it belongs to.
+    if memory_root is not None:
+        cfg.scheduler.store_path = os.path.join(base, "schedules.json")
 
     vad = build_vad(cfg.vad)
     segmenter = Segmenter(cfg.vad, cfg.audio.sample_rate, cfg.audio.frame_samples)
@@ -247,6 +253,11 @@ def assemble(
     asr = build_asr(cfg.asr)
     tts = build_tts(cfg.tts)
     llm = build_llm(cfg.llm)
+    scheduler = Scheduler(cfg.scheduler) if cfg.scheduler.enabled else None
+    # Tools act on the same memory the prompt reads from, so "remember X" in one
+    # turn is visible to "what is X?" in the next.  The scheduler is shared with
+    # the pipeline, which is what actually speaks a due reminder.
+    tools = build_tools(memory, cfg.tools, scheduler=scheduler)
     sink = build_sink(sink_kind, sink_path, device=cfg.audio.output_device)
     source = build_source(cfg.audio, source_kind, source_path, loop=source_loop)
 
@@ -274,6 +285,8 @@ def assemble(
         # Whether the microphone can hear the agent's own playback; only then is
         # the echo guard meaningful.
         live_capture=bool(getattr(source, "live", False)),
+        tools=tools,
+        scheduler=scheduler,
     )
     session = VoiceSession(cfg, pipeline, source, memory=memory)
     return pipeline, session

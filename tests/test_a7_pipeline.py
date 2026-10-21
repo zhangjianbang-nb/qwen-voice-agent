@@ -164,23 +164,47 @@ def test_pipeline_run_over_synthetic_source(tmp_path):
 
 
 class FakeVoiceprints:
-    """Stands in for VoiceprintStore: every utterance is (or is not) the owner."""
+    """Stands in for VoiceprintStore: each utterance is (or is not) the owner.
 
-    def __init__(self, accepted: bool) -> None:
-        self.accepted = accepted
+    ``accepted`` may be a bool or a sequence of bools, one per ``identify``
+    call.  The sequence form is what the barge-in tests need: the *first* call
+    decides whether the owner's initial utterance starts a turn, and a later
+    call decides whether the interrupting voice may cut it off.
+    """
+
+    def __init__(self, accepted) -> None:
+        self._sequence = list(accepted) if isinstance(accepted, (list, tuple)) else None
+        self.accepted = accepted if self._sequence is None else None
         self.calls = 0
 
     def identify(self, frame):
         from qwen_voice_agent.voiceprint import IdentificationResult
 
         self.calls += 1
+        if self._sequence is not None:
+            ok = self._sequence[min(self.calls - 1, len(self._sequence) - 1)]
+        else:
+            ok = bool(self.accepted)
         return IdentificationResult(
-            person_id="p1" if self.accepted else None,
-            name="Ada" if self.accepted else None,
-            score=0.9 if self.accepted else 0.05,
-            accepted=self.accepted,
-            ranking=[("p1", 0.9 if self.accepted else 0.05)],
+            person_id="p1" if ok else None,
+            name="Ada" if ok else None,
+            score=0.9 if ok else 0.05,
+            accepted=ok,
+            ranking=[("p1", 0.9 if ok else 0.05)],
         )
+
+
+def _wait_for_identify(vp, p, expected=1, timeout=2.0):
+    """Wait until the worker has identified the initial utterance.
+
+    Without this, the test races the generation thread: the barge-in candidate
+    can reach ``identify`` before the initial utterance does, which makes a
+    sequence-based fake voiceprint (and therefore the test) order-dependent.
+    """
+    deadline = time.monotonic() + timeout
+    while vp.calls < expected and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert vp.calls >= expected, "the initial utterance was never identified"
 
 
 def test_a_television_does_not_barge_in(tmp_path):
@@ -188,15 +212,17 @@ def test_a_television_does_not_barge_in(tmp_path):
     cfg = VoiceAgentConfig()
     cfg.vad.min_speech_ms = 200.0
     cfg.wake.require_enrolled = True
-    vp = FakeVoiceprints(accepted=False)
+    # First identify: the owner starts a turn.  Every later one: the television.
+    vp = FakeVoiceprints([True, False])
     p = _make(cfg, HangingTts(), tmp_path, voiceprints=vp)
     _open_and_close(p)
+    _wait_for_identify(vp, p)
     assert p.state == PipelineState.GENERATING
 
     # 40 frames = 0.8 s, past voiceprint.min_utterance_s (0.6 s).
     for _ in range(40):
         p.feed(_tone())
-    assert vp.calls >= 1, "the barge-in candidate was never checked against the voiceprint"
+    assert vp.calls >= 2, "the barge-in candidate was never checked against the voiceprint"
     assert p.state == PipelineState.GENERATING, "a non-owner voice cut the agent off"
     assert not p._cancel.is_set()
     p.close()
@@ -210,6 +236,7 @@ def test_the_owner_can_still_barge_in(tmp_path):
     vp = FakeVoiceprints(accepted=True)
     p = _make(cfg, HangingTts(), tmp_path, voiceprints=vp)
     _open_and_close(p)
+    _wait_for_identify(vp, p)
     assert p.state == PipelineState.GENERATING
 
     for _ in range(40):
@@ -241,7 +268,11 @@ def test_ignored_worker_returns_to_listening(tmp_path):
     cfg.wake.wake_word = "小丽同学"
     p = _make(cfg, FastTts(), tmp_path)
     _open_and_close(p)
-    assert p.state == PipelineState.GENERATING
+    # A very fast worker may already have finished by the time the closing
+    # silence frames are drained; either state is valid here.  The property
+    # under test is that the pipeline returns to LISTENING below.
+    assert p._workers, "closing an utterance must start a generation worker"
+    assert p.state in {PipelineState.GENERATING, PipelineState.LISTENING}
 
     deadline = time.time() + 3.0
     while time.time() < deadline and any(t.is_alive() for t in p._workers):

@@ -36,6 +36,17 @@ check "SenseVoice present" "sensevoice  : found" "$out"
 check "CAM++ present" "cam++       : found" "$out"
 check "piper voice present" "piper voice : found" "$out"
 
+step "tools"
+out=$($QVA tools 2>&1)
+check "fifteen built-in tools" "tools: 15" "$out"
+check "time tool exposed" "get_current_time" "$out"
+check "memory tools exposed" "remember_fact" "$out"
+check "file tools exposed" "write_file" "$out"
+check "browser/app tools exposed" "open_browser" "$out"
+check "reminder tools exposed" "set_reminder" "$out"
+check "scheduled task tool exposed" "schedule_task" "$out"
+check "desktop tools exposed" "type_text" "$out"
+
 step "ASR (SenseVoice, local)"
 out=$($QVA transcribe "$CACHE/speaker1_a_cn_16k.wav" 2>&1 | tail -1)
 check "non-empty Chinese transcript" "也" "$out"

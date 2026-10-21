@@ -258,6 +258,11 @@ class Segmenter:
         self._t = 0.0  # seconds of audio consumed so far
         self._frame_dur = frame_samples / float(sample_rate)
 
+    @property
+    def active(self) -> bool:
+        """True while an utterance is open (speech has started, not yet closed)."""
+        return self._active
+
     def reset(self) -> None:
         self._pre.clear()
         self._speech_run = self._silence_run = 0

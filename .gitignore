@@ -29,6 +29,9 @@ procedural.json
 # This deployment's runtime state: memory stores, voiceprints, smoke-test audio
 /state/
 
+# Files written by the agent's write_file tool
+/agent_files/
+
 # Local configuration
 config.local.json
 

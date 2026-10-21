@@ -192,6 +192,16 @@ class LLMConfig:
     max_tokens: int = 256
     timeout_s: float = 60.0
     system_prompt: str = (
+        "Rules: call the matching tool first when the answer depends on the "
+        "current time/date, or when the user asks you to write/read a file, open "
+        "a browser or app, control the desktop, or set/list/cancel a reminder; "
+        "use schedule_task when the user wants a task run at a time (weather, a "
+        "summary, a check), and set_reminder only for a fixed reminder sentence; "
+        "then answer in one short sentence. Saying \"I remembered it\" without "
+        "calling remember_fact stores nothing, and saying \"I set a reminder\" "
+        "without calling set_reminder schedules nothing; both are failures. Do "
+        "not call tools for ordinary conversation or general knowledge you "
+        "already know.\n\n"
         "You are a warm, concise voice assistant talking out loud to {person}. "
         "Reply in one or two short sentences; never use markdown or lists. "
         "Use the remembered context when it is relevant.\n\n{context}"
@@ -218,6 +228,18 @@ class MemoryConfig:
     context_budget_chars: int = 1200
     extract_facts: bool = True
     seed_skills: bool = True
+    # A restarted agent preloads this many past turns into working memory, so
+    # "what did I just say" survives a restart.  0 disables prewarming.
+    prewarm_turns: int = 4
+    # Semantic facts are bounded by count; the least recently updated are dropped
+    # by the maintenance loop.  0 means unbounded.
+    semantic_max_facts: int = 200
+    # JSONL logs rotate at this size, keeping one ``.1`` backup.  Bounds disk use
+    # and startup time for a 24/7 process.
+    voice_rotate_bytes: int = 8_000_000
+    episodic_rotate_bytes: int = 16_000_000
+    # Only this much of a JSONL log is read at startup.
+    jsonl_tail_bytes: int = 2_000_000
 
 
 @dataclass
@@ -284,6 +306,81 @@ class WakeConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    """One-shot and recurring reminders, delivered proactively.
+
+    ``store_path`` is derived from ``memory.root`` by :meth:`resolve_paths`, so a
+    ``--memory-root`` run keeps its reminders with the rest of its state.  The
+    pipeline polls it every ``poll_interval_s``; a due schedule is spoken through
+    the normal TTS/sink path, which means it is barge-in interruptible like any
+    other utterance.
+
+    ``retry_s`` is the delay after a failed or interrupted delivery.  A reminder
+    is never dropped because one TTS call failed.
+    """
+
+    enabled: bool = True
+    store_path: Optional[str] = None
+    poll_interval_s: float = 0.5
+    max_schedules: int = 100
+    speak_prefix: str = "提醒你："
+    retry_s: float = 60.0
+
+
+@dataclass
+class ToolsConfig:
+    """Tool calling for the agent.
+
+    ``enabled`` turns the loop on.  ``max_rounds`` bounds it: a model that keeps
+    emitting ``tool_calls`` instead of an answer must not spin forever, and the
+    final round is always asked without tools so the user hears something.
+
+    ``builtins`` names the safe local tools offered on every turn.  There is
+    deliberately no shell/exec tool: a voice agent that can run arbitrary
+    commands is a remote-code-execution endpoint with a microphone.
+
+    File tools are confined to ``workspace_root``; the browser accepts only
+    http/https; apps come from ``allowed_apps``.  Reminder tools require
+    ``scheduler.enabled``; desktop input tools require ``control_enabled`` and
+    are therefore not in the default list.
+    """
+
+    enabled: bool = True
+    max_rounds: int = 3
+    builtins: List[str] = field(
+        default_factory=lambda: [
+            "time",
+            "remember_fact",
+            "recall_fact",
+            "write_file",
+            "read_file",
+            "list_files",
+            "open_browser",
+            "open_app",
+        ]
+    )
+    # Desktop control (typing, key presses, screenshots) is opt-in.  Opening a
+    # browser or an allow-listed app is safe; synthesising keystrokes into
+    # whatever window has focus is not, so it must be turned on explicitly.
+    control_enabled: bool = False
+    # All file tools are confined to this directory; ``..`` and symlink escapes
+    # are rejected, and reads/writes are size-bounded.
+    workspace_root: str = "/home/whu/workspace/qwen-voice-agent/agent_files"
+    max_file_bytes: int = 65536
+    browser_command: str = "xdg-open"
+    # Only these names can be launched; values are argv[0] binaries, never shell
+    # strings, so a model cannot inject a command through the app name.
+    allowed_apps: Dict[str, str] = field(
+        default_factory=lambda: {
+            "firefox": "firefox",
+            "chrome": "google-chrome",
+            "files": "nautilus",
+            "terminal": "gnome-terminal",
+        }
+    )
+
+
+@dataclass
 class VoiceAgentConfig:
     """The whole agent's configuration."""
 
@@ -296,6 +393,8 @@ class VoiceAgentConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
     # Persons enrolled ahead of time: [{"person_id": "p1", "name": "Ada"}].
     persons: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -313,6 +412,8 @@ class VoiceAgentConfig:
         base = os.path.abspath(self.memory.root)
         if self.voiceprint.store_path is None:
             self.voiceprint.store_path = os.path.join(base, "voiceprints.json")
+        if self.scheduler.store_path is None:
+            self.scheduler.store_path = os.path.join(base, "schedules.json")
         return self
 
     def to_json(self, indent: int = 2) -> str:

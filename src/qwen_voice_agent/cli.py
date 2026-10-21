@@ -93,6 +93,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("doctor", help="report environment readiness")
+    sub.add_parser("tools", help="list the tools the agent can call")
 
     voices = sub.add_parser("voices", help="list the TTS voices available on this machine")
     voices.add_argument("--tts-backend", default=None)
@@ -206,8 +207,15 @@ def cmd_run(args) -> int:
 
     def report(turn):
         tag = " [interrupted]" if turn.interrupted else ""
+        used = ""
+        if turn.tool_calls:
+            used = " [tools: " + ", ".join(t["name"] for t in turn.tool_calls) + "]"
+        if turn.proactive:
+            label = "任务" if turn.proactive_kind == "task" else "提醒"
+            print(f"[{turn.index}] [{label} {turn.schedule_id}] -> {turn.reply!r}{tag}")
+            return
         who = turn.person_name or "unknown"
-        print(f"[{turn.index}] {who}: {turn.user_text!r} -> {turn.reply!r}{tag}")
+        print(f"[{turn.index}] {who}: {turn.user_text!r} -> {turn.reply!r}{used}{tag}")
 
     session.on_turn = report
     turns = session.run()
@@ -446,9 +454,31 @@ def cmd_speak(args) -> int:
     return 0
 
 
+def cmd_tools(args) -> int:
+    """Print the tool schemas the model is offered on every turn."""
+    from .memory import MemoryManager
+    from .scheduler import Scheduler
+    from .tools import build_tools
+
+    cfg = load_config(args.config)
+    memory = MemoryManager(cfg.memory, root=cfg.memory.root)
+    scheduler = Scheduler(cfg.scheduler) if cfg.scheduler.enabled else None
+    registry = build_tools(memory, cfg.tools, scheduler=scheduler)
+    if registry is None:
+        print("tools disabled (tools.enabled=false) or no built-ins selected")
+        return 0
+    print(f"tools: {len(registry)} (max_rounds={registry.max_rounds})")
+    for schema in registry.schemas():
+        fn = schema["function"]
+        print(f"\n{fn['name']} — {fn['description']}")
+        print(json.dumps(fn["parameters"], ensure_ascii=False, indent=2))
+    return 0
+
+
 _DISPATCH = {
     "run": cmd_run,
     "doctor": cmd_doctor,
+    "tools": cmd_tools,
     "enroll": cmd_enroll,
     "identify": cmd_identify,
     "transcribe": cmd_transcribe,
